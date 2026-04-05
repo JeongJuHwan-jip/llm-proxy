@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LLM Proxy Dashboard</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>LLM Proxy Dashboard</h1>
+    <div id="refresh-info">
+      Auto-refresh: <span id="countdown">30</span>s
+      <button id="btn-refresh">Refresh now</button>
+    </div>
+  </header>
+
+  <main>
+    <!-- Endpoint status cards -->
+    <section>
+      <h2>Endpoint Status</h2>
+      <div id="endpoints-container" class="cards">
+        <p class="loading">Loading…</p>
+      </div>
+    </section>
+
+    <!-- Recent requests table -->
+    <section>
+      <h2>Recent Requests <span id="total-count" class="badge"></span></h2>
+      <div class="table-wrapper">
+        <table id="requests-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Model</th>
+              <th>Endpoint</th>
+              <th>Status</th>
+              <th>Latency</th>
+              <th>Stream</th>
+              <th>Attempts</th>
+            </tr>
+          </thead>
+          <tbody id="requests-body">
+            <tr><td colspan="7" class="loading">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
