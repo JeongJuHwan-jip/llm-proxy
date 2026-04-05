@@ -13,14 +13,35 @@ A lightweight local proxy server that routes requests across multiple OpenAI-com
 - **Auth** — optional API key protection
 - **pip-installable** — single `pip install` + `llm-proxy start`
 
-## Quick Start
+## Getting Started (Development)
 
 ```bash
-pip install .
+git clone https://github.com/JeongJuHwan-jip/llm-proxy.git
+cd llm-proxy
+
+# Create and activate a virtual environment
+python -m venv .venv
+.venv\Scripts\activate        # Windows
+# source .venv/bin/activate   # Linux / Mac
+
+# Install in editable mode (code changes take effect immediately, no reinstall needed)
+pip install -e ".[test]"
+
+# Copy and edit the example config
 cp config.example.yaml config.yaml
-# edit config.yaml to point at your endpoints
+# Edit config.yaml — set your endpoint URLs
+
+# Validate config
+llm-proxy validate --config config.yaml
+
+# Start the server
 llm-proxy start --config config.yaml
 ```
+
+> **uv users** (faster alternative to pip/venv):
+> ```bash
+> uv venv && uv pip install -e ".[test]"
+> ```
 
 The proxy listens on `http://0.0.0.0:8000` by default.  
 Dashboard: `http://localhost:8000/dashboard/index.html`
@@ -80,13 +101,10 @@ llm-proxy validate --config config.yaml
 ## Development
 
 ```bash
-# Install in editable mode with test dependencies
-pip install -e ".[test]"
-
 # Run tests
 pytest
 
-# Run with live reload (development)
+# Run server (changes to src/ take effect immediately)
 llm-proxy start --config config.example.yaml
 ```
 
