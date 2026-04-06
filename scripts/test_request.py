@@ -75,7 +75,7 @@ def post_json(url: str, payload: dict, stream: bool = False) -> None:
         print(f"  body: {body_text[:300]}")
     except urllib.error.URLError as e:
         print(f"  CONNECTION ERROR: {e.reason}")
-        print("  → Is the server running?")
+        print("  -> Is the server running?")
 
 
 def get_models(url: str) -> None:
@@ -97,10 +97,10 @@ health_url = f"http://127.0.0.1:{args.port}/health"
 req = urllib.request.Request(health_url)
 try:
     with urllib.request.urlopen(req, timeout=3) as resp:
-        print(f"  OK — {resp.read().decode()}")
+        print(f"  OK - {resp.read().decode()}")
 except Exception as e:
     print(f"  FAILED: {e}")
-    print("  → Server is not running on this port. Start it first.")
+    print("  -> Server is not running on this port. Start it first.")
     sys.exit(1)
 
 # ── 2. Model list ──────────────────────────────────────────────────────────

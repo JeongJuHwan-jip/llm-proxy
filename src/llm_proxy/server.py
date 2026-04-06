@@ -350,11 +350,14 @@ async def _handle_stream(
             timeout = ep.timeout_ms / 1000.0
             t0 = time.monotonic()
             try:
-                # Use a streaming context — keep it open for the generator
+                # httpx >=0.20: timeout must be in request extensions, not send()
+                _t = {"connect": timeout, "read": timeout, "write": timeout, "pool": timeout}
                 resp = await client.send(
-                    client.build_request("POST", url, json=body, headers=headers),
+                    client.build_request(
+                        "POST", url, json=body, headers=headers,
+                        extensions={"timeout": _t},
+                    ),
                     stream=True,
-                    timeout=timeout,
                 )
                 latency_ms = (time.monotonic() - t0) * 1000
 
