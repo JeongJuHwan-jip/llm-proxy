@@ -118,14 +118,22 @@ def _register_routes(app: FastAPI) -> None:
     async def chat_completions(request: Request) -> Response:
         return await _handle_proxy(request, "/chat/completions")
 
-    # Catch-all for other /v1/* paths (e.g. /v1/models) — forward as-is
+    # GET /v1/models — fetch from first reachable upstream, fall back to config-based list
+    @app.get(
+        "/v1/models",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def list_models(request: Request) -> JSONResponse:
+        return await _handle_list_models(request)
+
+    # Catch-all for other /v1/* paths — forward with correct HTTP method
     @app.api_route(
         "/v1/{path:path}",
         methods=["GET", "POST", "PUT", "DELETE", "PATCH"],
         dependencies=[Depends(_require_api_key)],
     )
     async def proxy_passthrough(request: Request, path: str) -> Response:
-        return await _handle_proxy(request, f"/{path}")
+        return await _handle_passthrough(request, f"/{path}")
 
     # ----------------------------------------------------------------- status
     @app.get("/api/status")
@@ -383,6 +391,91 @@ async def _handle_stream(
         status_code=upstream_resp.status_code,
         media_type=upstream_resp.headers.get("content-type", "text/event-stream"),
         headers={"X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# /v1/models handler
+# ---------------------------------------------------------------------------
+
+async def _handle_list_models(request: Request) -> JSONResponse:
+    """Try to fetch /v1/models from the first reachable upstream.
+    Falls back to a synthetic list derived from the config endpoints.
+    """
+    import time as _time
+
+    client: httpx.AsyncClient = request.app.state.client
+    router: Router = request.app.state.router
+    cfg: ProxyConfig = request.app.state.config
+
+    candidates = router.get_candidates("*")
+    for ep in candidates:
+        try:
+            from .config import resolve_headers as _resolve
+            headers = _resolve(ep.headers)
+            resp = await client.get(
+                f"{ep.url}/models",
+                headers=headers,
+                timeout=ep.timeout_ms / 1000.0,
+            )
+            if resp.status_code == 200:
+                return JSONResponse(resp.json())
+        except Exception:
+            continue
+
+    # Fallback: synthetic model list from endpoint names in config
+    models = [
+        {
+            "id": ep.name,
+            "object": "model",
+            "created": int(_time.time()),
+            "owned_by": "llm-proxy",
+        }
+        for ep in cfg.endpoints
+    ]
+    return JSONResponse({"object": "list", "data": models})
+
+
+# ---------------------------------------------------------------------------
+# Generic passthrough for non-chat /v1/* routes
+# ---------------------------------------------------------------------------
+
+async def _handle_passthrough(request: Request, upstream_path: str) -> Response:
+    """Forward non-chat requests to the first reachable upstream as-is.
+    No failover logic — just forward with the correct HTTP method.
+    """
+    client: httpx.AsyncClient = request.app.state.client
+    router: Router = request.app.state.router
+
+    candidates = router.get_candidates("*")
+    if not candidates:
+        raise HTTPException(status_code=502, detail="No endpoints available")
+
+    ep = candidates[0]
+    from .config import resolve_headers as _resolve
+    headers = _resolve(ep.headers)
+    url = f"{ep.url}{upstream_path}"
+
+    # Read body only for methods that can carry one
+    body_bytes = b""
+    if request.method in ("POST", "PUT", "PATCH"):
+        body_bytes = await request.body()
+
+    try:
+        upstream = await client.request(
+            method=request.method,
+            url=url,
+            content=body_bytes or None,
+            headers=headers,
+            timeout=ep.timeout_ms / 1000.0,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type", "application/json"),
     )
 
 
