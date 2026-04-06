@@ -26,10 +26,9 @@ logger = logging.getLogger(__name__)
 # Special model ID that activates the full failover/circuit-breaker algorithm
 ROUTING_MODEL_ID = "llm-proxy/router"
 
-# Headers we copy from the incoming request to the upstream call
-_FORWARD_HEADERS = {"content-type", "accept", "accept-encoding"}
-
-# Headers that must NOT be forwarded upstream
+# Headers forwarded upstream — content-type is intentionally excluded:
+# httpx sets it automatically when using json=body, avoiding conflicts.
+_FORWARD_HEADERS = {"accept", "accept-encoding"}
 _STRIP_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}
 
 

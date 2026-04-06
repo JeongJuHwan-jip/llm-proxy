@@ -113,11 +113,22 @@ async def chat_completions(request: Request):
     _request_count += 1
     count = _request_count
 
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as exc:
+        print(f"[{SERVER_NAME}] #{count} Failed to parse body: {exc}")
+        return JSONResponse(
+            status_code=400,
+            content={"error": {"message": f"Invalid JSON body: {exc}", "type": "invalid_request_error"}},
+        )
+
+    if not isinstance(body, dict):
+        body = {}
+
     model = body.get("model", "mock-model")
     is_stream = body.get("stream", False)
 
-    print(f"[{SERVER_NAME}] #{count} {model!r} stream={is_stream} behavior={args.behavior}")
+    print(f"[{SERVER_NAME}] #{count} model={model!r} stream={is_stream} behavior={args.behavior}")
 
     # ── Apply behavior ──────────────────────────────────────────────────────
     if args.behavior == "timeout":
