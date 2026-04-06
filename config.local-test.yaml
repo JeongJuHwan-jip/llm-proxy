@@ -1,0 +1,46 @@
+# Local test config — works with scripts/mock_llm_server.py
+#
+# Start mock servers first:
+#   python scripts/mock_llm_server.py --port 8001 --behavior timeout --name alpha
+#   python scripts/mock_llm_server.py --port 8002 --behavior flaky --fail-rate 0.5 --name beta
+#   python scripts/mock_llm_server.py --port 8003 --behavior ok --name gamma
+#
+# Then start the proxy:
+#   llm-proxy start --config config.local-test.yaml --port 9000
+#
+# Then send a request:
+#   curl -s -X POST http://localhost:9000/v1/chat/completions \
+#     -H "Content-Type: application/json" \
+#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}' | python -m json.tool
+
+server:
+  host: "127.0.0.1"
+  port: 9000
+
+endpoints:
+  - name: "alpha-timeout"
+    url: "http://127.0.0.1:8001/v1"
+    timeout_ms: 2000          # alpha hangs → times out in 2s → failover
+    priority: 1
+    headers:
+      X-Request-ID: "{{uuid}}"
+
+  - name: "beta-flaky"
+    url: "http://127.0.0.1:8002/v1"
+    timeout_ms: 3000
+    priority: 2
+
+  - name: "gamma-ok"
+    url: "http://127.0.0.1:8003/v1"
+    timeout_ms: 5000
+    priority: 3
+
+failover:
+  max_retries: 2
+  circuit_breaker_threshold: 3   # alpha opens circuit after 3 timeouts
+  circuit_breaker_cooldown: 30
+  routing_strategy: "priority"
+
+logging:
+  db_path: "./data/local-test.db"
+  log_request_body: true         # OK for local testing
