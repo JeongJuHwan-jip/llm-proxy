@@ -21,6 +21,16 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _should_failover(status_code: int) -> bool:
+    """Return True if an HTTP status code should trigger failover to next endpoint.
+
+    5xx = server errors (worth retrying on another endpoint).
+    429 = rate limited (try another endpoint).
+    4xx other than 429 = client errors (same request will fail everywhere; don't retry).
+    """
+    return status_code >= 500 or status_code == 429
+
+
 class AllEndpointsFailedError(Exception):
     def __init__(self, attempts: list[AttemptLog]) -> None:
         self.attempts = attempts
@@ -220,6 +230,16 @@ class Router:
         try:
             response = await client.post(url, json=body, headers=headers, timeout=timeout)
             latency_ms = (time.monotonic() - t0) * 1000
+
+            if _should_failover(response.status_code):
+                logger.warning("Direct %r returned %d", ep.name, response.status_code)
+                self.record_failure(ep, is_timeout=False)
+                raise AllEndpointsFailedError([AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=False, is_timeout=False,
+                    error_message=f"HTTP {response.status_code}",
+                )])
+
             self.record_success(ep, latency_ms)
             attempts = [AttemptLog(
                 endpoint_name=ep.name, latency_ms=latency_ms,
@@ -292,6 +312,20 @@ class Router:
                     timeout=timeout,
                 )
                 latency_ms = (time.monotonic() - t0) * 1000
+
+                if _should_failover(response.status_code):
+                    logger.warning(
+                        "Upstream %r returned %d — treating as failure",
+                        ep.name, response.status_code,
+                    )
+                    self.record_failure(ep, is_timeout=False)
+                    attempts.append(AttemptLog(
+                        endpoint_name=ep.name, latency_ms=latency_ms,
+                        success=False, is_timeout=False,
+                        error_message=f"HTTP {response.status_code}",
+                    ))
+                    continue
+
                 self.record_success(ep, latency_ms)
                 attempts.append(
                     AttemptLog(

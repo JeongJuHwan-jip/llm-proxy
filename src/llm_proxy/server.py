@@ -357,6 +357,22 @@ async def _handle_stream(
                     timeout=timeout,
                 )
                 latency_ms = (time.monotonic() - t0) * 1000
+
+                from .router import _should_failover
+                if _should_failover(resp.status_code):
+                    await resp.aclose()
+                    logger.warning(
+                        "Stream upstream %r returned %d — trying next",
+                        ep.name, resp.status_code,
+                    )
+                    router.record_failure(ep, is_timeout=False)
+                    attempts.append(AttemptLog(
+                        endpoint_name=ep.name, latency_ms=latency_ms,
+                        success=False, is_timeout=False,
+                        error_message=f"HTTP {resp.status_code}",
+                    ))
+                    continue
+
                 router.record_success(ep, latency_ms)
                 attempts.append(
                     AttemptLog(
