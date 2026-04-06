@@ -43,6 +43,7 @@ class Router:
     def __init__(self, config: ProxyConfig) -> None:
         self._config = config
         self._failover = config.failover
+        self._ep_by_name: dict[str, EndpointState] = {}
         self._table: RoutingTable = self._build_routing_table()
 
     # ------------------------------------------------------------------
@@ -52,22 +53,66 @@ class Router:
     def _build_routing_table(self) -> RoutingTable:
         """Build the initial routing table.
 
-        All endpoints are stored under the "*" wildcard key.
-        Future extension: per-model keys like "gpt-4" can be added here
-        once model discovery is implemented.
+        Creates one EndpointState per endpoint (shared across all routing entries).
+        "*" wildcard covers all models by default.
+        Per-model routes from config.routing are applied on top.
         """
-        states = [
-            EndpointState(
+        for ep in self._config.endpoints:
+            self._ep_by_name[ep.name] = EndpointState(
                 name=ep.name,
                 url=ep.url,
                 timeout_ms=ep.timeout_ms,
                 priority=ep.priority,
                 headers=ep.headers,
             )
-            for ep in self._config.endpoints
-        ]
-        states.sort(key=lambda s: s.priority)
-        return {"*": states}
+
+        all_states = sorted(self._ep_by_name.values(), key=lambda s: s.priority)
+        table: RoutingTable = {"*": all_states}
+
+        for route in self._config.routing:
+            eps = [self._ep_by_name[n] for n in route.endpoints if n in self._ep_by_name]
+            if eps:
+                table[route.model] = eps
+                logger.info(
+                    "Model routing (config): %r -> [%s]",
+                    route.model,
+                    ", ".join(e.name for e in eps),
+                )
+            else:
+                logger.warning(
+                    "Model routing rule for %r references unknown endpoint(s): %s",
+                    route.model,
+                    [n for n in route.endpoints if n not in self._ep_by_name],
+                )
+
+        return table
+
+    def update_routing_from_discovery(self, discovered: dict[str, list[str]]) -> None:
+        """Merge auto-discovered model→endpoints into the routing table.
+
+        Only adds entries that are NOT already defined by config routing,
+        so config always takes precedence.
+
+        ``discovered`` maps model_id → [endpoint names in priority order].
+        """
+        added = 0
+        for model_id, ep_names in discovered.items():
+            if model_id in self._table:
+                continue  # config-defined route wins
+            eps = [self._ep_by_name[n] for n in ep_names if n in self._ep_by_name]
+            if eps:
+                self._table[model_id] = eps
+                added += 1
+        if added:
+            logger.info("Auto-discovery added %d model route(s)", added)
+
+    def get_routed_models(self) -> dict[str, list[str]]:
+        """Return non-wildcard routing entries as model → [endpoint names]."""
+        return {
+            model: [ep.name for ep in eps]
+            for model, eps in self._table.items()
+            if model != "*"
+        }
 
     # ------------------------------------------------------------------
     # Candidate selection
@@ -189,19 +234,10 @@ class Router:
     # ------------------------------------------------------------------
 
     def get_endpoint_by_name(self, name: str) -> EndpointState | None:
-        for endpoints in self._table.values():
-            for ep in endpoints:
-                if ep.name == name:
-                    return ep
-        return None
+        return self._ep_by_name.get(name)
 
     def all_endpoints(self) -> list[EndpointState]:
-        seen: dict[str, EndpointState] = {}
-        for endpoints in self._table.values():
-            for ep in endpoints:
-                if ep.name not in seen:
-                    seen[ep.name] = ep
-        return list(seen.values())
+        return list(self._ep_by_name.values())
 
     # ------------------------------------------------------------------
     # Direct execution (single endpoint, no failover)

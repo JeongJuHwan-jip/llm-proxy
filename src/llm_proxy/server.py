@@ -68,6 +68,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.router = router
         app.state.db = db
 
+        # Auto-discover models from all endpoints and populate routing table
+        await _discover_models(client, router)
+
         logger.info(
             "LLM Proxy started — %d endpoint(s) registered",
             len(cfg.endpoints),
@@ -462,14 +465,62 @@ async def _handle_stream(
 
 
 # ---------------------------------------------------------------------------
+# Model discovery (runs at startup)
+# ---------------------------------------------------------------------------
+
+async def _discover_models(
+    client: httpx.AsyncClient,
+    router: Router,
+) -> None:
+    """Fetch /v1/models from every endpoint and update the routing table.
+
+    Runs concurrently; individual failures are silently ignored.
+    Config-defined routing rules take precedence over discovered ones.
+    """
+    from .config import resolve_headers as _resolve
+
+    all_eps = router.all_endpoints()
+    # model_id → [(priority, ep_name)]
+    model_map: dict[str, list[tuple[int, str]]] = {}
+
+    async def _fetch(ep: EndpointState) -> None:
+        try:
+            headers = _resolve(ep.headers)
+            resp = await client.get(
+                f"{ep.url}/models",
+                headers=headers,
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                for m in resp.json().get("data", []):
+                    mid = m.get("id")
+                    if isinstance(mid, str):
+                        model_map.setdefault(mid, []).append((ep.priority, ep.name))
+        except Exception:
+            pass
+
+    await asyncio.gather(*[_fetch(ep) for ep in all_eps])
+
+    discovered = {
+        mid: [name for _, name in sorted(eps)]
+        for mid, eps in model_map.items()
+    }
+    router.update_routing_from_discovery(discovered)
+
+
+# ---------------------------------------------------------------------------
 # /v1/models handler
 # ---------------------------------------------------------------------------
 
 async def _handle_list_models(request: Request) -> JSONResponse:
-    """Query ALL endpoints concurrently and aggregate models as {endpoint}/{model_id}.
+    """Return a merged model list.
 
-    Always prepends the routing model (llm-proxy/router) as the first entry.
-    Falls back to endpoint names if an upstream is unreachable.
+    Response layout:
+      1. llm-proxy/router  — full failover across all endpoints
+      2. Per-model routed entries (from routing config or auto-discovery)
+         with x-routing metadata showing the endpoint priority order
+      3. Direct {endpoint}/{model} entries (bypass failover, go straight to
+         that endpoint) — fetched live from each upstream
     """
     import time as _time
     from .config import resolve_headers as _resolve
@@ -477,7 +528,21 @@ async def _handle_list_models(request: Request) -> JSONResponse:
     client: httpx.AsyncClient = request.app.state.client
     router: Router = request.app.state.router
 
-    async def _fetch(ep: "EndpointState") -> list[dict]:
+    # --- Section 2: routed models (from routing table) --------------------
+    routed_models = router.get_routed_models()
+    routed_entries = [
+        {
+            "id": model_id,
+            "object": "model",
+            "created": int(_time.time()),
+            "owned_by": "llm-proxy",
+            "x-routing": ep_names,  # extra metadata for tooling / dashboards
+        }
+        for model_id, ep_names in routed_models.items()
+    ]
+
+    # --- Section 3: direct {endpoint}/{model} entries (live fetch) -------
+    async def _fetch(ep: EndpointState) -> list[dict]:
         try:
             headers = _resolve(ep.headers)
             resp = await client.get(
@@ -494,7 +559,6 @@ async def _handle_list_models(request: Request) -> JSONResponse:
                 ]
         except Exception:
             pass
-        # Fallback: represent the endpoint itself as a model
         return [{
             "id": ep.name,
             "object": "model",
@@ -504,17 +568,21 @@ async def _handle_list_models(request: Request) -> JSONResponse:
 
     all_eps = router.all_endpoints()
     results = await asyncio.gather(*[_fetch(ep) for ep in all_eps])
-    aggregated = [m for models in results for m in models]
+    direct_entries = [m for models in results for m in models]
 
-    # Prepend the routing model
+    # --- Section 1: routing model -----------------------------------------
     routing_entry = {
         "id": ROUTING_MODEL_ID,
         "object": "model",
         "created": int(_time.time()),
         "owned_by": "llm-proxy",
-        "description": "Uses priority/latency failover across all endpoints",
+        "x-routing": [ep.name for ep in router.all_endpoints()],
     }
-    return JSONResponse({"object": "list", "data": [routing_entry, *aggregated]})
+
+    return JSONResponse({
+        "object": "list",
+        "data": [routing_entry, *routed_entries, *direct_entries],
+    })
 
 
 # ---------------------------------------------------------------------------

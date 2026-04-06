@@ -69,12 +69,26 @@ class AuthConfig(BaseModel):
     api_keys: list[str] = Field(default_factory=list)
 
 
+class ModelRouteConfig(BaseModel):
+    """Explicit routing rule: which endpoints handle a model, in priority order."""
+    model: str
+    endpoints: list[str]  # endpoint names, first = highest priority
+
+    @field_validator("endpoints")
+    @classmethod
+    def endpoints_not_empty(cls, v: list[str]) -> list[str]:
+        if not v:
+            raise ValueError("endpoints list must not be empty")
+        return v
+
+
 class ProxyConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
     endpoints: list[EndpointConfig]
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     auth: AuthConfig | None = None
+    routing: list[ModelRouteConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def check_endpoints_not_empty(self) -> "ProxyConfig":

@@ -41,6 +41,14 @@ failover:
   circuit_breaker_cooldown: 30
   routing_strategy: "priority"
 
+# Per-model routing: override the global endpoint priority order per model.
+# Endpoints not listed here fall back to the global order (alpha → beta → gamma).
+routing:
+  - model: "gpt-4"
+    endpoints: ["alpha-timeout", "beta-flaky", "gamma-ok"]
+  - model: "mock-model"
+    endpoints: ["gamma-ok", "beta-flaky"]   # gamma first for mock-model
+
 logging:
   db_path: "./data/local-test.db"
   log_request_body: true         # OK for local testing
