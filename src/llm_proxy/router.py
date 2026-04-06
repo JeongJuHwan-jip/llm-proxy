@@ -175,6 +175,77 @@ class Router:
         return list(seen.values())
 
     # ------------------------------------------------------------------
+    # Lookup helpers
+    # ------------------------------------------------------------------
+
+    def get_endpoint_by_name(self, name: str) -> EndpointState | None:
+        for endpoints in self._table.values():
+            for ep in endpoints:
+                if ep.name == name:
+                    return ep
+        return None
+
+    def all_endpoints(self) -> list[EndpointState]:
+        seen: dict[str, EndpointState] = {}
+        for endpoints in self._table.values():
+            for ep in endpoints:
+                if ep.name not in seen:
+                    seen[ep.name] = ep
+        return list(seen.values())
+
+    # ------------------------------------------------------------------
+    # Direct execution (single endpoint, no failover)
+    # ------------------------------------------------------------------
+
+    async def execute_direct(
+        self,
+        client: "httpx.AsyncClient",
+        ep: EndpointState,
+        path: str,
+        body: dict,
+        extra_headers: dict[str, str],
+    ) -> tuple["httpx.Response", list[AttemptLog]]:
+        """Send to a specific endpoint without failover.
+
+        Raises AllEndpointsFailedError if the single attempt fails.
+        """
+        import httpx as _httpx
+
+        headers = resolve_headers(ep.headers)
+        headers.update(extra_headers)
+        url = f"{ep.url}{path}"
+        timeout = ep.timeout_ms / 1000.0
+        t0 = time.monotonic()
+
+        try:
+            response = await client.post(url, json=body, headers=headers, timeout=timeout)
+            latency_ms = (time.monotonic() - t0) * 1000
+            self.record_success(ep, latency_ms)
+            attempts = [AttemptLog(
+                endpoint_name=ep.name, latency_ms=latency_ms,
+                success=True, is_timeout=False,
+            )]
+            return response, attempts
+
+        except _httpx.TimeoutException as exc:
+            latency_ms = (time.monotonic() - t0) * 1000
+            logger.warning("Direct timeout on %r: %s", ep.name, exc)
+            self.record_failure(ep, is_timeout=True)
+            raise AllEndpointsFailedError([AttemptLog(
+                endpoint_name=ep.name, latency_ms=latency_ms,
+                success=False, is_timeout=True, error_message=str(exc),
+            )])
+
+        except Exception as exc:  # noqa: BLE001
+            latency_ms = (time.monotonic() - t0) * 1000
+            logger.warning("Direct error on %r: %s", ep.name, exc)
+            self.record_failure(ep, is_timeout=False)
+            raise AllEndpointsFailedError([AttemptLog(
+                endpoint_name=ep.name, latency_ms=latency_ms,
+                success=False, is_timeout=False, error_message=str(exc),
+            )])
+
+    # ------------------------------------------------------------------
     # Failover execution helper
     # ------------------------------------------------------------------
 

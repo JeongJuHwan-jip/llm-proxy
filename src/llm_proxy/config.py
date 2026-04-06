@@ -50,6 +50,7 @@ class FailoverConfig(BaseModel):
     circuit_breaker_threshold: int = Field(default=3, ge=1)
     circuit_breaker_cooldown: int = Field(default=60, ge=0)
     routing_strategy: str = "priority"  # "priority" | "latency"
+    default_model: str = "gpt-4"        # model name sent upstream when routing model is selected
 
     @field_validator("routing_strategy")
     @classmethod

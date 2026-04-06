@@ -18,10 +18,13 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import ProxyConfig
 from .database import Database
-from .models import AttemptLog, RequestLog
+from .models import AttemptLog, EndpointState, RequestLog
 from .router import AllEndpointsFailedError, Router
 
 logger = logging.getLogger(__name__)
+
+# Special model ID that activates the full failover/circuit-breaker algorithm
+ROUTING_MODEL_ID = "llm-proxy/router"
 
 # Headers we copy from the incoming request to the upstream call
 _FORWARD_HEADERS = {"content-type", "accept", "accept-encoding"}
@@ -177,6 +180,30 @@ def _register_routes(app: FastAPI) -> None:
 # Proxy handler
 # ---------------------------------------------------------------------------
 
+def _parse_model(model_id: str, router: Router, cfg: ProxyConfig) -> tuple[str | None, str]:
+    """Interpret the model ID sent by the client.
+
+    Returns (endpoint_name_or_None, actual_model_to_send_upstream).
+
+    Cases:
+      "llm-proxy/router"   → (None, cfg.failover.default_model)   full failover
+      "alpha/gpt-4"        → ("alpha", "gpt-4")                   direct to alpha
+      "gpt-4"              → (None, "gpt-4")                       full failover, legacy
+    """
+    if model_id == ROUTING_MODEL_ID:
+        return None, cfg.failover.default_model
+
+    # Check if it matches an "endpoint_name/model" pattern
+    if "/" in model_id:
+        ep_name, _, actual_model = model_id.partition("/")
+        ep = router.get_endpoint_by_name(ep_name)
+        if ep is not None:
+            return ep_name, actual_model
+
+    # Unknown format — treat as regular model name with full failover
+    return None, model_id
+
+
 async def _handle_proxy(request: Request, upstream_path: str) -> Response:
     client: httpx.AsyncClient = request.app.state.client
     router: Router = request.app.state.router
@@ -189,8 +216,14 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
+    raw_model: str = body.get("model", "unknown")
+    target_ep_name, actual_model = _parse_model(raw_model, router, cfg)
+
+    # Replace model in the body that will be forwarded upstream
+    body = {**body, "model": actual_model}
+
     is_stream: bool = bool(body.get("stream", False))
-    model: str = body.get("model", "unknown")
+    model: str = raw_model  # keep original for logging
 
     # Build headers to forward
     forward_headers: dict[str, str] = {
@@ -207,12 +240,14 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
             client, router, db, cfg,
             upstream_path, body, forward_headers,
             model, log_body, t_start,
+            target_ep_name=target_ep_name,
         )
     else:
         return await _handle_normal(
             client, router, db, cfg,
             upstream_path, body, forward_headers,
             model, log_body, t_start,
+            target_ep_name=target_ep_name,
         )
 
 
@@ -227,12 +262,17 @@ async def _handle_normal(
     model: str,
     log_body: dict | None,
     t_start: float,
+    target_ep_name: str | None = None,
 ) -> Response:
     loop = asyncio.get_event_loop()
     try:
-        response, ep, attempts = await router.execute(
-            client, path, body, extra_headers
-        )
+        if target_ep_name is not None:
+            ep = router.get_endpoint_by_name(target_ep_name)
+            if ep is None:
+                raise HTTPException(status_code=400, detail=f"Unknown endpoint: {target_ep_name!r}")
+            response, attempts = await router.execute_direct(client, ep, path, body, extra_headers)
+        else:
+            response, ep, attempts = await router.execute(client, path, body, extra_headers)
     except AllEndpointsFailedError as exc:
         total_ms = (time.monotonic() - t_start) * 1000
         log = RequestLog(
@@ -280,15 +320,24 @@ async def _handle_stream(
     model: str,
     log_body: dict | None,
     t_start: float,
+    target_ep_name: str | None = None,
 ) -> StreamingResponse:
     from .config import resolve_headers as _resolve
 
     loop = asyncio.get_event_loop()
-    candidates = router.get_candidates(model)
-    if not candidates:
-        raise HTTPException(status_code=502, detail="No endpoints available")
 
-    max_attempts = min(len(candidates), router._failover.max_retries + 1)
+    if target_ep_name is not None:
+        _ep = router.get_endpoint_by_name(target_ep_name)
+        if _ep is None:
+            raise HTTPException(status_code=400, detail=f"Unknown endpoint: {target_ep_name!r}")
+        candidates = [_ep]
+        max_attempts = 1
+    else:
+        candidates = router.get_candidates(model)
+        if not candidates:
+            raise HTTPException(status_code=502, detail="No endpoints available")
+        max_attempts = min(len(candidates), router._failover.max_retries + 1)
+
     attempts: list[AttemptLog] = []
 
     async def _try_stream() -> tuple[httpx.Response, object, list[AttemptLog]]:
@@ -399,19 +448,19 @@ async def _handle_stream(
 # ---------------------------------------------------------------------------
 
 async def _handle_list_models(request: Request) -> JSONResponse:
-    """Try to fetch /v1/models from the first reachable upstream.
-    Falls back to a synthetic list derived from the config endpoints.
+    """Query ALL endpoints concurrently and aggregate models as {endpoint}/{model_id}.
+
+    Always prepends the routing model (llm-proxy/router) as the first entry.
+    Falls back to endpoint names if an upstream is unreachable.
     """
     import time as _time
+    from .config import resolve_headers as _resolve
 
     client: httpx.AsyncClient = request.app.state.client
     router: Router = request.app.state.router
-    cfg: ProxyConfig = request.app.state.config
 
-    candidates = router.get_candidates("*")
-    for ep in candidates:
+    async def _fetch(ep: "EndpointState") -> list[dict]:
         try:
-            from .config import resolve_headers as _resolve
             headers = _resolve(ep.headers)
             resp = await client.get(
                 f"{ep.url}/models",
@@ -419,21 +468,35 @@ async def _handle_list_models(request: Request) -> JSONResponse:
                 timeout=ep.timeout_ms / 1000.0,
             )
             if resp.status_code == 200:
-                return JSONResponse(resp.json())
+                data = resp.json().get("data", [])
+                return [
+                    {**m, "id": f"{ep.name}/{m['id']}"}
+                    for m in data
+                    if isinstance(m.get("id"), str)
+                ]
         except Exception:
-            continue
-
-    # Fallback: synthetic model list from endpoint names in config
-    models = [
-        {
+            pass
+        # Fallback: represent the endpoint itself as a model
+        return [{
             "id": ep.name,
             "object": "model",
             "created": int(_time.time()),
             "owned_by": "llm-proxy",
-        }
-        for ep in cfg.endpoints
-    ]
-    return JSONResponse({"object": "list", "data": models})
+        }]
+
+    all_eps = router.all_endpoints()
+    results = await asyncio.gather(*[_fetch(ep) for ep in all_eps])
+    aggregated = [m for models in results for m in models]
+
+    # Prepend the routing model
+    routing_entry = {
+        "id": ROUTING_MODEL_ID,
+        "object": "model",
+        "created": int(_time.time()),
+        "owned_by": "llm-proxy",
+        "description": "Uses priority/latency failover across all endpoints",
+    }
+    return JSONResponse({"object": "list", "data": [routing_entry, *aggregated]})
 
 
 # ---------------------------------------------------------------------------
