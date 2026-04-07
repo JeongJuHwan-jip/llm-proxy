@@ -97,8 +97,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # --------------------------------------------
 
         logger.info(
-            "LLM Proxy started — %d server(s) registered",
-            len(router.all_endpoints()),
+            "LLM Proxy started — %d endpoint(s) registered",
+            len(cfg.endpoints),
         )
         yield
 

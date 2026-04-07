@@ -7,15 +7,28 @@
 #
 # Then start the proxy:
 #   llm-proxy start --config config.local-test.yaml --port 9000
-#
-# Then send a request:
-#   curl -s -X POST http://localhost:9000/v1/chat/completions \
-#     -H "Content-Type: application/json" \
-#     -d '{"model":"best-available","messages":[{"role":"user","content":"hello"}]}' | python -m json.tool
 
 server:
   host: "127.0.0.1"
   port: 9000
+
+endpoints:
+  - name: "alpha"
+    url: "http://127.0.0.1:8001/v1"
+    timeout_ms: 2000          # alpha hangs → times out in 2s → failover
+    priority: 1
+    headers:
+      X-Request-ID: "{{uuid}}"
+
+  - name: "beta"
+    url: "http://127.0.0.1:8002/v1"
+    timeout_ms: 3000
+    priority: 2
+
+  - name: "gamma"
+    url: "http://127.0.0.1:8003/v1"
+    timeout_ms: 5000
+    priority: 3
 
 failover:
   max_retries: 3
@@ -24,44 +37,26 @@ failover:
   routing_strategy: "priority"
 
 # Named fallback chains — each appears as a selectable model in /v1/models.
-# Steps are tried in order; circuit-open steps are skipped automatically.
-# The same server URL can appear multiple times (different models, shared CB state).
+# Same endpoint can appear multiple times with different models.
 routing:
   - name: "best-available"
     chain:
-      - url: "http://127.0.0.1:8001/v1"
-        model: "gpt-4"
-        timeout_ms: 2000        # alpha hangs → times out → failover
-        name: "alpha"
-        headers:
-          X-Request-ID: "{{uuid}}"
+      - endpoint: alpha
+        model: gpt-4
+      - endpoint: beta
+        model: llama-3
+      - endpoint: gamma
+        model: mistral-7b
 
-      - url: "http://127.0.0.1:8002/v1"
-        model: "llama-3"
-        timeout_ms: 3000
-        name: "beta"
-
-      - url: "http://127.0.0.1:8003/v1"
-        model: "mistral-7b"
-        timeout_ms: 5000
-        name: "gamma"
-
-  # Same servers, different models — demonstrates repeated-URL pattern
   - name: "gpt4-chain"
     chain:
-      - url: "http://127.0.0.1:8001/v1"
-        model: "gpt-4"
-        timeout_ms: 2000
-        name: "alpha"
-      - url: "http://127.0.0.1:8002/v1"
-        model: "gpt-4"
-        timeout_ms: 3000
-        name: "beta"
-      - url: "http://127.0.0.1:8001/v1"   # alpha again, cheaper model fallback
-        model: "claude-3"
-        timeout_ms: 2000
-        name: "alpha"
+      - endpoint: alpha
+        model: gpt-4
+      - endpoint: beta
+        model: gpt-4
+      - endpoint: alpha         # same endpoint, different model fallback
+        model: claude-3
 
 logging:
   db_path: "./data/local-test.db"
-  log_request_body: true         # OK for local testing
+  log_request_body: true

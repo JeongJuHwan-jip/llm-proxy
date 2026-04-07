@@ -4,40 +4,29 @@ from __future__ import annotations
 
 import pytest
 
-from llm_proxy.config import (
-    FailoverConfig,
-    LoggingConfig,
-    ProxyConfig,
-    RouteConfig,
-    RouteStepConfig,
-    ServerConfig,
-)
+from llm_proxy.config import EndpointConfig, FailoverConfig, LoggingConfig, ProxyConfig, ServerConfig
 
 
 @pytest.fixture
 def minimal_config() -> ProxyConfig:
-    """A minimal valid ProxyConfig with two servers (alpha, beta)."""
+    """A minimal valid ProxyConfig with two endpoints."""
     return ProxyConfig(
         server=ServerConfig(host="127.0.0.1", port=8000),
-        routing=[
-            RouteConfig(
-                name="default",
-                chain=[
-                    RouteStepConfig(
-                        url="https://alpha.example.com/v1",
-                        model="gpt-4",
-                        timeout_ms=5000,
-                        name="alpha",
-                        headers={"X-ID": "{{uuid}}"},
-                    ),
-                    RouteStepConfig(
-                        url="https://beta.example.com/v1",
-                        model="gpt-4",
-                        timeout_ms=8000,
-                        name="beta",
-                    ),
-                ],
-            )
+        endpoints=[
+            EndpointConfig(
+                name="alpha",
+                url="https://alpha.example.com/v1",
+                timeout_ms=5000,
+                priority=1,
+                headers={"X-ID": "{{uuid}}"},
+            ),
+            EndpointConfig(
+                name="beta",
+                url="https://beta.example.com/v1",
+                timeout_ms=8000,
+                priority=2,
+                headers={},
+            ),
         ],
         failover=FailoverConfig(
             max_retries=2,

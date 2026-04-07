@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "scanned_at": 1775568365.7763362,
+  "models": {},
+  "endpoint_models": {
+    "mock-ep": []
+  },
+  "endpoint_reachable": {
+    "mock-ep": false
+  }
+}
