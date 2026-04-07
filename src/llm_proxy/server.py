@@ -18,6 +18,15 @@ from fastapi.staticfiles import StaticFiles
 
 from .config import ProxyConfig
 from .database import Database
+from .discovery import (
+    DiscoveryResult,
+    diff_discovery,
+    load_snapshot,
+    log_discovery_diff,
+    log_first_discovery,
+    run_discovery,
+    save_snapshot,
+)
 from .models import AttemptLog, EndpointState, RequestLog
 from .router import AllEndpointsFailedError, Router
 
@@ -68,8 +77,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.router = router
         app.state.db = db
 
-        # Auto-discover models from all endpoints and populate routing table
-        await _discover_models(client, router)
+        # ---- model discovery & change detection ----
+        snapshot_path = Path(cfg.logging.db_path).parent / "model_snapshot.json"
+        old_snapshot = load_snapshot(snapshot_path)
+
+        discovery = await run_discovery(client, router.all_endpoints())
+        router.update_routing_from_discovery(discovery.models)
+        save_snapshot(snapshot_path, discovery)
+
+        app.state.discovery = discovery
+        if old_snapshot is None:
+            log_first_discovery(discovery)
+            app.state.discovery_diff = None
+        else:
+            routed = set(router.get_routed_models().keys())
+            diff = diff_discovery(old_snapshot, discovery, routed)
+            log_discovery_diff(diff)
+            app.state.discovery_diff = diff
+        # --------------------------------------------
 
         logger.info(
             "LLM Proxy started — %d endpoint(s) registered",
@@ -167,6 +192,31 @@ def _register_routes(app: FastAPI) -> None:
         loop = asyncio.get_event_loop()
         stats = await loop.run_in_executor(None, db.get_endpoint_stats)
         return JSONResponse(stats)
+
+    @app.get("/api/discovery")
+    async def api_discovery(request: Request) -> JSONResponse:
+        discovery: DiscoveryResult = request.app.state.discovery
+        diff = request.app.state.discovery_diff  # DiscoveryDiff | None
+
+        diff_payload = None
+        if diff is not None:
+            diff_payload = {
+                "new_models": diff.new_models,
+                "removed_models": diff.removed_models,
+                "routing_lost": diff.routing_lost,
+                "new_endpoints_for": diff.new_endpoints_for,
+                "lost_endpoints_for": diff.lost_endpoints_for,
+                "has_changes": diff.has_changes,
+                "requires_onboarding": diff.requires_onboarding,
+            }
+
+        return JSONResponse({
+            "scanned_at": discovery.scanned_at,
+            "models": discovery.models,
+            "endpoint_models": discovery.endpoint_models,
+            "endpoint_reachable": discovery.endpoint_reachable,
+            "diff": diff_payload,
+        })
 
     # ---------------------------------------------------------------- root
     @app.get("/")
@@ -462,50 +512,6 @@ async def _handle_stream(
         media_type=upstream_resp.headers.get("content-type", "text/event-stream"),
         headers={"X-Accel-Buffering": "no"},
     )
-
-
-# ---------------------------------------------------------------------------
-# Model discovery (runs at startup)
-# ---------------------------------------------------------------------------
-
-async def _discover_models(
-    client: httpx.AsyncClient,
-    router: Router,
-) -> None:
-    """Fetch /v1/models from every endpoint and update the routing table.
-
-    Runs concurrently; individual failures are silently ignored.
-    Config-defined routing rules take precedence over discovered ones.
-    """
-    from .config import resolve_headers as _resolve
-
-    all_eps = router.all_endpoints()
-    # model_id → [(priority, ep_name)]
-    model_map: dict[str, list[tuple[int, str]]] = {}
-
-    async def _fetch(ep: EndpointState) -> None:
-        try:
-            headers = _resolve(ep.headers)
-            resp = await client.get(
-                f"{ep.url}/models",
-                headers=headers,
-                timeout=5.0,
-            )
-            if resp.status_code == 200:
-                for m in resp.json().get("data", []):
-                    mid = m.get("id")
-                    if isinstance(mid, str):
-                        model_map.setdefault(mid, []).append((ep.priority, ep.name))
-        except Exception:
-            pass
-
-    await asyncio.gather(*[_fetch(ep) for ep in all_eps])
-
-    discovered = {
-        mid: [name for _, name in sorted(eps)]
-        for mid, eps in model_map.items()
-    }
-    router.update_routing_from_discovery(discovered)
 
 
 # ---------------------------------------------------------------------------

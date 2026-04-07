@@ -72,6 +72,74 @@ def start(config: str, host: str | None, port: int | None, workers: int) -> None
     )
 
 
+@main.command("discover")
+@click.option(
+    "--config",
+    "-c",
+    required=True,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Path to config.yaml",
+)
+@click.option(
+    "--snippet",
+    is_flag=True,
+    default=False,
+    help="Print a ready-to-paste 'routing:' config snippet after the table.",
+)
+def discover(config: str, snippet: bool) -> None:
+    """Discover models from all configured endpoints and show a routing overview.
+
+    Run this to see which models are available and on which endpoints,
+    then use the output to build (or update) the 'routing:' section in
+    your config file.
+    """
+    if sys.platform == "win32":
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+    import httpx as _httpx
+
+    from .discovery import run_discovery
+    from .router import Router
+
+    cfg = load_config(config)
+    router = Router(cfg)
+
+    async def _run():
+        async with _httpx.AsyncClient() as client:
+            return await run_discovery(client, router.all_endpoints())
+
+    result = asyncio.run(_run())
+
+    # ---- endpoint reachability table ----
+    click.echo()
+    click.echo("Endpoint status:")
+    for ep_name, reachable in sorted(result.endpoint_reachable.items()):
+        status = "OK         " if reachable else "UNREACHABLE"
+        model_count = len(result.endpoint_models.get(ep_name, []))
+        click.echo(f"  {status}  {ep_name:<25} ({model_count} model(s))")
+
+    # ---- model → endpoint table ----
+    click.echo()
+    if not result.models:
+        click.echo("No models found on any reachable endpoint.")
+    else:
+        click.echo(f"Available models ({len(result.models)} total):\n")
+        col = max(len(m) for m in result.models) + 2
+        for model_id, eps in sorted(result.models.items()):
+            ep_str = " -> ".join(eps)
+            click.echo(f"  {model_id:<{col}} {ep_str}")
+
+    # ---- routing snippet ----
+    if snippet and result.models:
+        click.echo()
+        click.echo("# --- paste into your config.yaml ---")
+        click.echo("routing:")
+        for model_id, eps in sorted(result.models.items()):
+            click.echo(f"  - model: \"{model_id}\"")
+            click.echo(f"    endpoints: {eps}")
+        click.echo("# ------------------------------------")
+
+
 @main.command("validate")
 @click.option(
     "--config",

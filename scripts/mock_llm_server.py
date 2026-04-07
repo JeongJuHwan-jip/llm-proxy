@@ -5,7 +5,7 @@ Simulates an OpenAI-compatible /v1/chat/completions endpoint
 with configurable behavior: success, delay, timeout, error.
 
 Usage:
-    # Normal server on port 8001
+    # Normal server on port 8001 with default models (mock-model, gpt-4)
     python scripts/mock_llm_server.py --port 8001
 
     # Server that always times out (for failover testing)
@@ -16,6 +16,12 @@ Usage:
 
     # Server with 3s artificial delay
     python scripts/mock_llm_server.py --port 8004 --behavior slow --delay 3.0
+
+    # Server with a custom model list (simulates different endpoints having
+    # different models — pass comma-separated model IDs)
+    python scripts/mock_llm_server.py --port 8001 --models gpt-4,claude-3-opus
+    python scripts/mock_llm_server.py --port 8002 --models gpt-4,llama-3,mistral-7b
+    python scripts/mock_llm_server.py --port 8003 --models mistral-7b
 
 Behaviors:
     ok       — always returns a valid response (default)
@@ -49,9 +55,16 @@ parser.add_argument("--delay", type=float, default=2.0,
                     help="Delay in seconds for --behavior slow")
 parser.add_argument("--name", type=str, default=None,
                     help="Server name shown in responses (defaults to port)")
+parser.add_argument("--models", type=str, default=None,
+                    help="Comma-separated model IDs to advertise (default: mock-model,gpt-4)")
 args = parser.parse_args()
 
 SERVER_NAME = args.name or f"mock-{args.port}"
+MODEL_IDS: list[str] = (
+    [m.strip() for m in args.models.split(",") if m.strip()]
+    if args.models
+    else ["mock-model", "gpt-4"]
+)
 
 app = FastAPI(title=f"Mock LLM ({SERVER_NAME})")
 
@@ -172,8 +185,8 @@ async def list_models():
     return JSONResponse({
         "object": "list",
         "data": [
-            {"id": "mock-model", "object": "model", "created": int(time.time()), "owned_by": SERVER_NAME},
-            {"id": "gpt-4", "object": "model", "created": int(time.time()), "owned_by": SERVER_NAME},
+            {"id": mid, "object": "model", "created": int(time.time()), "owned_by": SERVER_NAME}
+            for mid in MODEL_IDS
         ],
     })
 
@@ -184,5 +197,6 @@ async def health():
 
 
 if __name__ == "__main__":
-    print(f"Starting {SERVER_NAME} on port {args.port} [behavior={args.behavior}]")
+    print(f"Starting {SERVER_NAME} on port {args.port} "
+          f"[behavior={args.behavior}] models={MODEL_IDS}")
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")
