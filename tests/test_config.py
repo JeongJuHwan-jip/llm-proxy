@@ -78,15 +78,18 @@ def _write_config(data: dict) -> Path:
 
 def test_load_minimal_config():
     cfg_data = {
-        "endpoints": [
-            {"name": "alpha", "url": "https://alpha.example.com/v1", "priority": 1}
-        ]
+        "routing": [{
+            "name": "default",
+            "chain": [
+                {"url": "https://alpha.example.com/v1", "model": "gpt-4"},
+            ],
+        }]
     }
     path = _write_config(cfg_data)
     try:
         cfg = load_config(path)
-        assert len(cfg.endpoints) == 1
-        assert cfg.endpoints[0].name == "alpha"
+        assert len(cfg.routing) == 1
+        assert cfg.routing[0].chain[0].url == "https://alpha.example.com/v1"
         assert cfg.server.port == 8000  # default
     finally:
         path.unlink()
@@ -95,15 +98,16 @@ def test_load_minimal_config():
 def test_load_full_config():
     cfg_data = {
         "server": {"host": "0.0.0.0", "port": 9000},
-        "endpoints": [
-            {
-                "name": "ep1",
+        "routing": [{
+            "name": "ep1-route",
+            "chain": [{
                 "url": "https://ep1.example.com/v1",
+                "model": "gpt-4",
                 "timeout_ms": 3000,
-                "priority": 1,
+                "name": "ep1",
                 "headers": {"X-Key": "val"},
-            }
-        ],
+            }],
+        }],
         "failover": {
             "max_retries": 1,
             "circuit_breaker_threshold": 5,
@@ -125,8 +129,8 @@ def test_load_full_config():
         path.unlink()
 
 
-def test_load_config_no_endpoints_raises():
-    cfg_data = {"endpoints": []}
+def test_load_config_no_routing_raises():
+    cfg_data = {"routing": []}
     path = _write_config(cfg_data)
     try:
         with pytest.raises(Exception):
@@ -137,7 +141,10 @@ def test_load_config_no_endpoints_raises():
 
 def test_load_config_invalid_url_raises():
     cfg_data = {
-        "endpoints": [{"name": "bad", "url": "ftp://bad.example.com", "priority": 1}]
+        "routing": [{
+            "name": "bad",
+            "chain": [{"url": "ftp://bad.example.com", "model": "gpt-4"}],
+        }]
     }
     path = _write_config(cfg_data)
     try:
@@ -150,9 +157,10 @@ def test_load_config_invalid_url_raises():
 def test_load_config_env_key(monkeypatch):
     monkeypatch.setenv("PROXY_KEY", "runtime-secret")
     cfg_data = {
-        "endpoints": [
-            {"name": "ep", "url": "https://ep.example.com/v1", "priority": 1}
-        ],
+        "routing": [{
+            "name": "ep",
+            "chain": [{"url": "https://ep.example.com/v1", "model": "gpt-4"}],
+        }],
         "auth": {"api_keys": ["{{env:PROXY_KEY}}"]},
     }
     path = _write_config(cfg_data)
@@ -167,3 +175,23 @@ def test_load_config_env_key(monkeypatch):
 def test_load_config_missing_file():
     with pytest.raises(FileNotFoundError):
         load_config("/nonexistent/path/config.yaml")
+
+
+def test_same_url_appears_twice_shares_circuit_breaker(minimal_config):
+    """Two steps with the same URL should map to the same EndpointState."""
+    from llm_proxy.config import RouteConfig, RouteStepConfig
+    from llm_proxy.router import Router
+
+    minimal_config.routing[0].chain.append(
+        RouteStepConfig(
+            url="https://alpha.example.com/v1",  # same URL as step 0
+            model="gpt-3.5-turbo",
+            name="alpha",
+        )
+    )
+    router = Router(minimal_config)
+    # There should still be only 2 unique servers (alpha, beta)
+    assert len(router.all_endpoints()) == 2
+    # Both alpha steps should share the same EndpointState object
+    steps = router.get_route("default")
+    assert steps[0].endpoint is steps[2].endpoint

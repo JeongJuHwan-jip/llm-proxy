@@ -30,21 +30,6 @@ class ServerConfig(BaseModel):
     port: int = 8000
 
 
-class EndpointConfig(BaseModel):
-    name: str
-    url: str
-    timeout_ms: int = Field(default=10000, gt=0)
-    priority: int = Field(default=1, ge=1)
-    headers: dict[str, str] = Field(default_factory=dict)
-
-    @field_validator("url")
-    @classmethod
-    def validate_url(cls, v: str) -> str:
-        if not (v.startswith("http://") or v.startswith("https://")):
-            raise ValueError(f"Endpoint URL must start with http:// or https://: {v!r}")
-        return v.rstrip("/")
-
-
 class FailoverConfig(BaseModel):
     max_retries: int = Field(default=2, ge=0)
     circuit_breaker_threshold: int = Field(default=3, ge=1)
@@ -70,10 +55,31 @@ class AuthConfig(BaseModel):
 
 
 class RouteStepConfig(BaseModel):
-    """One step in a named route: which server to try and which model to request."""
+    """One step in a route chain: the upstream server + model to request there.
 
-    server: str   # must match an endpoint name
-    model: str    # model name sent to that server
+    ``url``        — base URL of the upstream LLM server.
+    ``model``      — model name sent to that server for this step.
+    ``timeout_ms`` — per-step request timeout (ms).
+    ``name``       — optional display name; derived from URL netloc when absent.
+    ``headers``    — static/template headers added to this server's requests.
+
+    Steps that share the same ``url`` share a single circuit-breaker state,
+    so the same server can appear multiple times in a chain with different models:
+      alpha/gpt-4  →  beta/llama-3  →  alpha/gpt-3.5  →  beta/mistral  → …
+    """
+
+    url: str
+    model: str
+    timeout_ms: int = Field(default=10000, gt=0)
+    name: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("url")
+    @classmethod
+    def validate_url(cls, v: str) -> str:
+        if not (v.startswith("http://") or v.startswith("https://")):
+            raise ValueError(f"URL must start with http:// or https://: {v!r}")
+        return v.rstrip("/")
 
 
 class RouteConfig(BaseModel):
@@ -92,16 +98,15 @@ class RouteConfig(BaseModel):
 
 class ProxyConfig(BaseModel):
     server: ServerConfig = Field(default_factory=ServerConfig)
-    endpoints: list[EndpointConfig]
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     auth: AuthConfig | None = None
     routing: list[RouteConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
-    def check_endpoints_not_empty(self) -> "ProxyConfig":
-        if not self.endpoints:
-            raise ValueError("At least one endpoint must be configured")
+    def check_routing_not_empty(self) -> "ProxyConfig":
+        if not self.routing:
+            raise ValueError("At least one routing entry must be configured")
         return self
 
 
@@ -186,8 +191,8 @@ def load_config(path: str | Path) -> ProxyConfig:
         config.auth.api_keys = [k for k in config.auth.api_keys if k]
 
     logger.info(
-        "Loaded config: %d endpoint(s), strategy=%s, db=%s",
-        len(config.endpoints),
+        "Loaded config: %d route(s), strategy=%s, db=%s",
+        len(config.routing),
         config.failover.routing_strategy,
         config.logging.db_path,
     )

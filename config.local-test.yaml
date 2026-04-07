@@ -1,9 +1,9 @@
 # Local test config — works with scripts/mock_llm_server.py
 #
 # Start mock servers first:
-#   python scripts/mock_llm_server.py --port 8001 --behavior timeout --name alpha
-#   python scripts/mock_llm_server.py --port 8002 --behavior flaky --fail-rate 0.5 --name beta
-#   python scripts/mock_llm_server.py --port 8003 --behavior ok --name gamma
+#   python scripts/mock_llm_server.py --port 8001 --behavior timeout --name alpha --models gpt-4,claude-3
+#   python scripts/mock_llm_server.py --port 8002 --behavior flaky --fail-rate 0.5 --name beta --models gpt-4,llama-3,mistral-7b
+#   python scripts/mock_llm_server.py --port 8003 --behavior ok --name gamma --models mistral-7b
 #
 # Then start the proxy:
 #   llm-proxy start --config config.local-test.yaml --port 9000
@@ -11,48 +11,56 @@
 # Then send a request:
 #   curl -s -X POST http://localhost:9000/v1/chat/completions \
 #     -H "Content-Type: application/json" \
-#     -d '{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}' | python -m json.tool
+#     -d '{"model":"best-available","messages":[{"role":"user","content":"hello"}]}' | python -m json.tool
 
 server:
   host: "127.0.0.1"
   port: 9000
 
-endpoints:
-  - name: "alpha-timeout"
-    url: "http://127.0.0.1:8001/v1"
-    timeout_ms: 2000          # alpha hangs → times out in 2s → failover
-    priority: 1
-    headers:
-      X-Request-ID: "{{uuid}}"
-
-  - name: "beta-flaky"
-    url: "http://127.0.0.1:8002/v1"
-    timeout_ms: 3000
-    priority: 2
-
-  - name: "gamma-ok"
-    url: "http://127.0.0.1:8003/v1"
-    timeout_ms: 5000
-    priority: 3
-
 failover:
-  max_retries: 2
+  max_retries: 3
   circuit_breaker_threshold: 3   # alpha opens circuit after 3 timeouts
   circuit_breaker_cooldown: 30
   routing_strategy: "priority"
 
 # Named fallback chains — each appears as a selectable model in /v1/models.
-# Each step specifies which server to try AND which model to request on that server.
-# Steps are tried in order; failed/circuit-open steps are skipped automatically.
+# Steps are tried in order; circuit-open steps are skipped automatically.
+# The same server URL can appear multiple times (different models, shared CB state).
 routing:
   - name: "best-available"
     chain:
-      - server: alpha-timeout
-        model: gpt-4
-      - server: beta-flaky
-        model: mock-model
-      - server: gamma-ok
-        model: mock-model
+      - url: "http://127.0.0.1:8001/v1"
+        model: "gpt-4"
+        timeout_ms: 2000        # alpha hangs → times out → failover
+        name: "alpha"
+        headers:
+          X-Request-ID: "{{uuid}}"
+
+      - url: "http://127.0.0.1:8002/v1"
+        model: "llama-3"
+        timeout_ms: 3000
+        name: "beta"
+
+      - url: "http://127.0.0.1:8003/v1"
+        model: "mistral-7b"
+        timeout_ms: 5000
+        name: "gamma"
+
+  # Same servers, different models — demonstrates repeated-URL pattern
+  - name: "gpt4-chain"
+    chain:
+      - url: "http://127.0.0.1:8001/v1"
+        model: "gpt-4"
+        timeout_ms: 2000
+        name: "alpha"
+      - url: "http://127.0.0.1:8002/v1"
+        model: "gpt-4"
+        timeout_ms: 3000
+        name: "beta"
+      - url: "http://127.0.0.1:8001/v1"   # alpha again, cheaper model fallback
+        model: "claude-3"
+        timeout_ms: 2000
+        name: "alpha"
 
 logging:
   db_path: "./data/local-test.db"

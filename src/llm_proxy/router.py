@@ -6,6 +6,8 @@ import logging
 import time
 from typing import TYPE_CHECKING
 
+from urllib.parse import urlparse
+
 from .config import ProxyConfig, resolve_headers
 from .models import (
     AttemptLog,
@@ -54,42 +56,55 @@ class Router:
     def _build_routing_table(self) -> RoutingTable:
         """Build the initial routing table.
 
-        Creates one EndpointState per endpoint (shared across all routing entries).
+        Iterates all route chains, deduplicates servers by URL (first occurrence
+        defines the EndpointState), then registers named routes.
 
         Table layout:
-          "*"             — wildcard; step.model=None (inherit from request)
-          "<route-name>"  — named chain; each step has explicit (endpoint, model)
+          "*"             — wildcard; one step per unique server, model=None
+          "<route-name>"  — named chain; each step carries explicit (endpoint, model)
         """
-        for ep in self._config.endpoints:
-            self._ep_by_name[ep.name] = EndpointState(
-                name=ep.name,
-                url=ep.url,
-                timeout_ms=ep.timeout_ms,
-                priority=ep.priority,
-                headers=ep.headers,
-            )
-
-        # "*" wildcard: all endpoints sorted by priority, model inherited per-request
-        all_states = sorted(self._ep_by_name.values(), key=lambda s: s.priority)
-        table: RoutingTable = {
-            "*": [RouteStep(ep, None) for ep in all_states]
-        }
+        # Pass 1: collect unique servers by URL in first-seen order
+        seen_urls: dict[str, EndpointState] = {}  # url → EndpointState
+        next_priority = 1
 
         for route in self._config.routing:
-            steps: list[RouteStep] = []
-            unknown: list[str] = []
             for step_cfg in route.chain:
-                ep = self._ep_by_name.get(step_cfg.server)
+                url = step_cfg.url
+                if url in seen_urls:
+                    continue
+
+                # Derive display name: explicit > URL netloc
+                name = step_cfg.name or (urlparse(url).netloc or url)
+                # Ensure uniqueness among already-registered names
+                base = name
+                suffix = 2
+                while name in self._ep_by_name:
+                    name = f"{base}-{suffix}"
+                    suffix += 1
+
+                ep = EndpointState(
+                    name=name,
+                    url=url,
+                    timeout_ms=step_cfg.timeout_ms,
+                    priority=next_priority,
+                    headers=step_cfg.headers,
+                )
+                seen_urls[url] = ep
+                self._ep_by_name[name] = ep
+                next_priority += 1
+
+        # "*" wildcard: all unique servers in priority order, model inherited
+        all_states = sorted(self._ep_by_name.values(), key=lambda s: s.priority)
+        table: RoutingTable = {"*": [RouteStep(ep, None) for ep in all_states]}
+
+        # Pass 2: build named routes
+        for route in self._config.routing:
+            steps: list[RouteStep] = []
+            for step_cfg in route.chain:
+                ep = seen_urls.get(step_cfg.url)
                 if ep is not None:
                     steps.append(RouteStep(ep, step_cfg.model))
-                else:
-                    unknown.append(step_cfg.server)
 
-            if unknown:
-                logger.warning(
-                    "Route %r references unknown endpoint(s): %s — those steps skipped",
-                    route.name, unknown,
-                )
             if steps:
                 table[route.name] = steps
                 logger.info(

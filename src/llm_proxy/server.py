@@ -97,8 +97,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # --------------------------------------------
 
         logger.info(
-            "LLM Proxy started — %d endpoint(s) registered",
-            len(cfg.endpoints),
+            "LLM Proxy started — %d server(s) registered",
+            len(router.all_endpoints()),
         )
         yield
 
@@ -585,11 +585,11 @@ async def _handle_passthrough(request: Request, upstream_path: str) -> Response:
     client: httpx.AsyncClient = request.app.state.client
     router: Router = request.app.state.router
 
-    candidates = router.get_candidates("*")
+    candidates = router.filter_steps(router.get_route("*"))
     if not candidates:
         raise HTTPException(status_code=502, detail="No endpoints available")
 
-    ep = candidates[0]
+    ep = candidates[0].endpoint
     from .config import resolve_headers as _resolve
     headers = _resolve(ep.headers)
     url = f"{ep.url}{upstream_path}"

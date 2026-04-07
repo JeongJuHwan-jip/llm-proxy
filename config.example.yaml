@@ -2,54 +2,53 @@ server:
   host: "0.0.0.0"
   port: 8000
 
-endpoints:
-  - name: "llm-api-alpha"
-    url: "https://internal-alpha.company.com/v1"
-    timeout_ms: 5000
-    priority: 1
-    headers:
-      X-Request-ID: "{{uuid}}"
-      X-Service-Key: "fixed-value-123"
-
-  - name: "llm-api-beta"
-    url: "https://internal-beta.company.com/v1"
-    timeout_ms: 8000
-    priority: 2
-    headers:
-      Authorization: "Bearer {{env:BETA_API_KEY}}"
-
-  - name: "llm-api-gamma"
-    url: "https://internal-gamma.company.com/v1"
-    timeout_ms: 10000
-    priority: 3
-
 failover:
   max_retries: 2
   circuit_breaker_threshold: 3
   circuit_breaker_cooldown: 60
   routing_strategy: "priority"   # "priority" or "latency"
 
-# Optional: named fallback chains.
-# Each entry creates a selectable "model" in /v1/models named by `name`.
-# Each chain step specifies BOTH the server AND the model to request there —
-# so different steps can use completely different models on different servers.
+# Each routing entry becomes a selectable "model" in /v1/models.
+# A chain is an ordered list of (server, model) pairs tried top-to-bottom.
+# The same server URL can appear multiple times with different models —
+# those steps share a single circuit-breaker state.
 #
-# routing:
-#   - name: "best-available"
-#     chain:
-#       - server: llm-api-alpha
-#         model: gpt-4
-#       - server: llm-api-beta
-#         model: llama-3-70b    # beta runs a different model
-#       - server: llm-api-gamma
-#         model: mistral-7b     # gamma runs yet another model
-#
-#   - name: "gpt4-only"
-#     chain:
-#       - server: llm-api-alpha
-#         model: gpt-4
-#       - server: llm-api-beta
-#         model: gpt-4
+# Example: alpha/gpt-4 → beta/llama-3 → alpha/gpt-3.5 → beta/mistral
+routing:
+  - name: "best-available"
+    chain:
+      - url: "https://internal-alpha.company.com/v1"
+        model: "gpt-4"
+        timeout_ms: 5000
+        name: "alpha"              # optional display name
+        headers:
+          X-Request-ID: "{{uuid}}"
+          X-Service-Key: "fixed-value-123"
+
+      - url: "https://internal-beta.company.com/v1"
+        model: "llama-3-70b"
+        timeout_ms: 8000
+        name: "beta"
+        headers:
+          Authorization: "Bearer {{env:BETA_API_KEY}}"
+
+      - url: "https://internal-gamma.company.com/v1"
+        model: "mistral-7b"
+        timeout_ms: 10000
+        name: "gamma"
+
+  # A second chain that falls back from gpt-4 on alpha to gpt-3.5 on the same
+  # alpha server — same circuit-breaker, cheaper fallback model.
+  - name: "gpt4-with-fallback"
+    chain:
+      - url: "https://internal-alpha.company.com/v1"
+        model: "gpt-4"
+        timeout_ms: 5000
+        name: "alpha"
+      - url: "https://internal-alpha.company.com/v1"  # same server, different model
+        model: "gpt-3.5-turbo"
+        timeout_ms: 5000
+        name: "alpha"
 
 logging:
   db_path: "./data/proxy.db"
