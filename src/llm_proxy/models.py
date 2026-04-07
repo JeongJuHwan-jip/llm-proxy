@@ -53,10 +53,24 @@ class EndpointState:
         return self.total_failures / self.total_requests
 
 
-# RoutingTable maps model name → ordered list of EndpointState.
-# "*" is the wildcard key used when no model-specific list exists.
-# Future: add model-specific keys like "gpt-4" for per-model routing.
-RoutingTable = dict[str, list[EndpointState]]
+@dataclass
+class RouteStep:
+    """One step in a named route: the endpoint to try and the model to request.
+
+    ``model`` is the model name sent to this specific endpoint.
+    When None (only used for the "*" wildcard), the caller should substitute
+    the model name from the incoming request.
+    """
+
+    endpoint: EndpointState
+    model: str | None  # None → inherit from the incoming request
+
+
+# RoutingTable maps route-name → ordered list of RouteStep.
+#   "*"              — wildcard fallback; step.model is always None
+#   "best-available" — named route; each step carries its own (endpoint, model)
+#   "gpt-4"          — auto-discovered; every step uses model="gpt-4"
+RoutingTable = dict[str, list[RouteStep]]
 
 
 @dataclass

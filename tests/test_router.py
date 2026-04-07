@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from llm_proxy.models import EndpointState
+from llm_proxy.models import EndpointState, RouteStep
 from llm_proxy.router import AllEndpointsFailedError, Router
 
 
@@ -17,10 +17,15 @@ from llm_proxy.router import AllEndpointsFailedError, Router
 
 
 def get_ep(router: Router, name: str) -> EndpointState:
-    for ep in router._table["*"]:
-        if ep.name == name:
-            return ep
-    raise KeyError(name)
+    """Return the shared EndpointState for the given endpoint name."""
+    ep = router.get_endpoint_by_name(name)
+    if ep is None:
+        raise KeyError(name)
+    return ep
+
+
+def step_names(steps: list[RouteStep]) -> list[str]:
+    return [s.endpoint.name for s in steps]
 
 
 # ---------------------------------------------------------------------------
@@ -30,30 +35,29 @@ def get_ep(router: Router, name: str) -> EndpointState:
 
 def test_candidates_priority_order(minimal_config):
     router = Router(minimal_config)
-    candidates = router.get_candidates("gpt-4")
-    assert [c.name for c in candidates] == ["alpha", "beta"]
+    steps = router.filter_steps(router.get_route("gpt-4"))
+    assert step_names(steps) == ["alpha", "beta"]
 
 
 def test_candidates_wildcard_fallback(minimal_config):
     router = Router(minimal_config)
-    # No model-specific key exists — should fall back to "*"
-    candidates = router.get_candidates("some-unknown-model")
-    assert len(candidates) == 2
+    # No named route exists — get_route falls back to "*"
+    steps = router.filter_steps(router.get_route("some-unknown-model"))
+    assert len(steps) == 2
 
 
 def test_candidates_latency_strategy(minimal_config):
     minimal_config.failover.routing_strategy = "latency"
     router = Router(minimal_config)
 
-    # Give beta a very low latency so it ranks first
     beta = get_ep(router, "beta")
     beta.latency_samples.append(10.0)
 
     alpha = get_ep(router, "alpha")
     alpha.latency_samples.append(500.0)
 
-    candidates = router.get_candidates("*")
-    assert candidates[0].name == "beta"
+    steps = router.filter_steps(router.get_route("*"))
+    assert steps[0].endpoint.name == "beta"
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +85,10 @@ def test_circuit_excludes_open_endpoint(minimal_config):
     router.record_failure(alpha, is_timeout=False)
     assert alpha.circuit_state == "open"
 
-    candidates = router.get_candidates("*")
-    assert all(c.name != "alpha" for c in candidates)
-    assert len(candidates) == 1
-    assert candidates[0].name == "beta"
+    steps = router.filter_steps(router.get_route("*"))
+    assert all(s.endpoint.name != "alpha" for s in steps)
+    assert len(steps) == 1
+    assert steps[0].endpoint.name == "beta"
 
 
 def test_circuit_transitions_to_half_open_after_cooldown(minimal_config):
@@ -96,13 +100,11 @@ def test_circuit_transitions_to_half_open_after_cooldown(minimal_config):
     router.record_failure(alpha, is_timeout=True)
     assert alpha.circuit_state == "open"
 
-    # Force open_since to be in the past
     alpha.open_since = time.monotonic() - 1
 
-    candidates = router.get_candidates("*")
-    # After cooldown expired, alpha should be HALF_OPEN and included
+    steps = router.filter_steps(router.get_route("*"))
     assert alpha.circuit_state == "half_open"
-    assert any(c.name == "alpha" for c in candidates)
+    assert any(s.endpoint.name == "alpha" for s in steps)
 
 
 def test_circuit_closes_on_success_from_half_open(minimal_config):
@@ -181,11 +183,12 @@ async def test_execute_returns_on_first_success(minimal_config):
     mock_client = AsyncMock()
     mock_client.post = AsyncMock(return_value=mock_response)
 
-    response, ep, attempts = await router.execute(
-        mock_client, "/chat/completions", {"model": "gpt-4"}, {}
+    steps = router.get_route("gpt-4")
+    response, winning_step, attempts = await router.execute(
+        mock_client, "/chat/completions", {"model": "gpt-4"}, {}, steps, "gpt-4"
     )
     assert response.status_code == 200
-    assert ep.name == "alpha"
+    assert winning_step.endpoint.name == "alpha"
     assert len(attempts) == 1
     assert attempts[0].success is True
 
@@ -200,11 +203,7 @@ async def test_execute_failover_on_timeout(minimal_config):
     mock_response = MagicMock()
     mock_response.status_code = 200
 
-    call_count = 0
-
     async def mock_post(url, **kwargs):
-        nonlocal call_count
-        call_count += 1
         if "alpha" in url:
             raise httpx.TimeoutException("timed out")
         return mock_response
@@ -212,10 +211,11 @@ async def test_execute_failover_on_timeout(minimal_config):
     mock_client = AsyncMock()
     mock_client.post = mock_post
 
-    response, ep, attempts = await router.execute(
-        mock_client, "/chat/completions", {"model": "gpt-4"}, {}
+    steps = router.get_route("gpt-4")
+    response, winning_step, attempts = await router.execute(
+        mock_client, "/chat/completions", {"model": "gpt-4"}, {}, steps, "gpt-4"
     )
-    assert ep.name == "beta"
+    assert winning_step.endpoint.name == "beta"
     assert attempts[0].success is False
     assert attempts[0].is_timeout is True
     assert attempts[1].success is True
@@ -233,8 +233,9 @@ async def test_execute_raises_when_all_fail(minimal_config):
     mock_client = AsyncMock()
     mock_client.post = mock_post
 
+    steps = router.get_route("gpt-4")
     with pytest.raises(AllEndpointsFailedError) as exc_info:
         await router.execute(
-            mock_client, "/chat/completions", {"model": "gpt-4"}, {}
+            mock_client, "/chat/completions", {"model": "gpt-4"}, {}, steps, "gpt-4"
         )
     assert len(exc_info.value.attempts) > 0

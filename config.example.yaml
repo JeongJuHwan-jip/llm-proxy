@@ -29,16 +29,27 @@ failover:
   circuit_breaker_cooldown: 60
   routing_strategy: "priority"   # "priority" or "latency"
 
-# Optional: per-model routing rules.
-# Lists endpoints in priority order for each model.
-# Config-defined rules take precedence over auto-discovery.
-# If omitted, all models fall back to the global endpoint priority order.
+# Optional: named fallback chains.
+# Each entry creates a selectable "model" in /v1/models named by `name`.
+# Each chain step specifies BOTH the server AND the model to request there —
+# so different steps can use completely different models on different servers.
 #
 # routing:
-#   - model: "gpt-4"
-#     endpoints: ["llm-api-alpha", "llm-api-beta", "llm-api-gamma"]
-#   - model: "claude-3-opus"
-#     endpoints: ["llm-api-beta"]   # only beta supports this model
+#   - name: "best-available"
+#     chain:
+#       - server: llm-api-alpha
+#         model: gpt-4
+#       - server: llm-api-beta
+#         model: llama-3-70b    # beta runs a different model
+#       - server: llm-api-gamma
+#         model: mistral-7b     # gamma runs yet another model
+#
+#   - name: "gpt4-only"
+#     chain:
+#       - server: llm-api-alpha
+#         model: gpt-4
+#       - server: llm-api-beta
+#         model: gpt-4
 
 logging:
   db_path: "./data/proxy.db"

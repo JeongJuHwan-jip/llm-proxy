@@ -27,7 +27,7 @@ from .discovery import (
     run_discovery,
     save_snapshot,
 )
-from .models import AttemptLog, EndpointState, RequestLog
+from .models import AttemptLog, EndpointState, RequestLog, RouteStep
 from .router import AllEndpointsFailedError, Router
 
 logger = logging.getLogger(__name__)
@@ -232,28 +232,36 @@ def _register_routes(app: FastAPI) -> None:
 # Proxy handler
 # ---------------------------------------------------------------------------
 
-def _parse_model(model_id: str, router: Router, cfg: ProxyConfig) -> tuple[str | None, str]:
-    """Interpret the model ID sent by the client.
+def _resolve_route(
+    model_id: str,
+    router: Router,
+    cfg: ProxyConfig,
+) -> tuple[list[RouteStep], str]:
+    """Resolve a client-supplied model ID into (steps, fallback_model).
 
-    Returns (endpoint_name_or_None, actual_model_to_send_upstream).
+    ``steps``          — ordered list of (endpoint, model) pairs to attempt.
+    ``fallback_model`` — model name used when a step has model=None (wildcard steps).
 
     Cases:
-      "llm-proxy/router"   → (None, cfg.failover.default_model)   full failover
-      "alpha/gpt-4"        → ("alpha", "gpt-4")                   direct to alpha
-      "gpt-4"              → (None, "gpt-4")                       full failover, legacy
+      "llm-proxy/router"   → wildcard steps, fallback = cfg.failover.default_model
+      "best-available"     → named route steps (each step has its own model)
+      "alpha/gpt-4"        → single direct step: alpha endpoint with gpt-4
+      "gpt-4"              → auto-discovered route, or wildcard fallback with "gpt-4"
     """
+    # 1. Special routing model → full wildcard failover
     if model_id == ROUTING_MODEL_ID:
-        return None, cfg.failover.default_model
+        return router.get_route("*"), cfg.failover.default_model
 
-    # Check if it matches an "endpoint_name/model" pattern
+    # 2. "endpoint_name/model" → single direct step
     if "/" in model_id:
         ep_name, _, actual_model = model_id.partition("/")
         ep = router.get_endpoint_by_name(ep_name)
         if ep is not None:
-            return ep_name, actual_model
+            return [RouteStep(ep, actual_model)], actual_model
 
-    # Unknown format — treat as regular model name with full failover
-    return None, model_id
+    # 3. Named route or auto-discovered model → use routing table
+    steps = router.get_route(model_id)
+    return steps, model_id
 
 
 async def _handle_proxy(request: Request, upstream_path: str) -> Response:
@@ -269,15 +277,11 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     raw_model: str = body.get("model", "unknown")
-    target_ep_name, actual_model = _parse_model(raw_model, router, cfg)
-
-    # Replace model in the body that will be forwarded upstream
-    body = {**body, "model": actual_model}
+    steps, fallback_model = _resolve_route(raw_model, router, cfg)
 
     is_stream: bool = bool(body.get("stream", False))
-    model: str = raw_model  # keep original for logging
 
-    # Build headers to forward
+    # Build headers to forward (model will be set per-step in the handlers)
     forward_headers: dict[str, str] = {
         k: v
         for k, v in request.headers.items()
@@ -291,15 +295,15 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
         return await _handle_stream(
             client, router, db, cfg,
             upstream_path, body, forward_headers,
-            model, log_body, t_start,
-            target_ep_name=target_ep_name,
+            raw_model, log_body, t_start,
+            steps=steps, fallback_model=fallback_model,
         )
     else:
         return await _handle_normal(
             client, router, db, cfg,
             upstream_path, body, forward_headers,
-            model, log_body, t_start,
-            target_ep_name=target_ep_name,
+            raw_model, log_body, t_start,
+            steps=steps, fallback_model=fallback_model,
         )
 
 
@@ -314,17 +318,14 @@ async def _handle_normal(
     model: str,
     log_body: dict | None,
     t_start: float,
-    target_ep_name: str | None = None,
+    steps: list[RouteStep],
+    fallback_model: str,
 ) -> Response:
     loop = asyncio.get_event_loop()
     try:
-        if target_ep_name is not None:
-            ep = router.get_endpoint_by_name(target_ep_name)
-            if ep is None:
-                raise HTTPException(status_code=400, detail=f"Unknown endpoint: {target_ep_name!r}")
-            response, attempts = await router.execute_direct(client, ep, path, body, extra_headers)
-        else:
-            response, ep, attempts = await router.execute(client, path, body, extra_headers)
+        response, winning_step, attempts = await router.execute(
+            client, path, body, extra_headers, steps, fallback_model,
+        )
     except AllEndpointsFailedError as exc:
         total_ms = (time.monotonic() - t_start) * 1000
         log = RequestLog(
@@ -344,7 +345,7 @@ async def _handle_normal(
     log = RequestLog(
         timestamp=time.time(),
         model=model,
-        selected_endpoint=ep.name,
+        selected_endpoint=winning_step.endpoint.name,
         attempts=attempts,
         status="success",
         total_latency_ms=total_ms,
@@ -353,7 +354,6 @@ async def _handle_normal(
     )
     await loop.run_in_executor(None, db.insert_request_log, log)
 
-    # Forward the upstream response back to the caller
     return Response(
         content=response.content,
         status_code=response.status_code,
@@ -372,31 +372,29 @@ async def _handle_stream(
     model: str,
     log_body: dict | None,
     t_start: float,
-    target_ep_name: str | None = None,
+    steps: list[RouteStep],
+    fallback_model: str,
 ) -> StreamingResponse:
     from .config import resolve_headers as _resolve
+    from .router import _should_failover
 
     loop = asyncio.get_event_loop()
 
-    if target_ep_name is not None:
-        _ep = router.get_endpoint_by_name(target_ep_name)
-        if _ep is None:
-            raise HTTPException(status_code=400, detail=f"Unknown endpoint: {target_ep_name!r}")
-        candidates = [_ep]
-        max_attempts = 1
-    else:
-        candidates = router.get_candidates(model)
-        if not candidates:
-            raise HTTPException(status_code=502, detail="No endpoints available")
-        max_attempts = min(len(candidates), router._failover.max_retries + 1)
+    eligible = router.filter_steps(steps)
+    if not eligible:
+        raise HTTPException(status_code=502, detail="No endpoints available")
 
+    max_attempts = min(len(eligible), router._failover.max_retries + 1)
     attempts: list[AttemptLog] = []
 
-    async def _try_stream() -> tuple[httpx.Response, object, list[AttemptLog]]:
-        """Try each candidate until one starts streaming successfully."""
+    async def _try_stream() -> tuple[httpx.Response, RouteStep, list[AttemptLog]]:
         import httpx as _httpx
 
-        for ep in candidates[:max_attempts]:
+        for step in eligible[:max_attempts]:
+            ep = step.endpoint
+            model_for_step = step.model or fallback_model
+            body_for_step = {**body, "model": model_for_step}
+
             headers = _resolve(ep.headers)
             headers.update(extra_headers)
             url = f"{ep.url}{path}"
@@ -407,19 +405,18 @@ async def _handle_stream(
                 _t = {"connect": timeout, "read": timeout, "write": timeout, "pool": timeout}
                 resp = await client.send(
                     client.build_request(
-                        "POST", url, json=body, headers=headers,
+                        "POST", url, json=body_for_step, headers=headers,
                         extensions={"timeout": _t},
                     ),
                     stream=True,
                 )
                 latency_ms = (time.monotonic() - t0) * 1000
 
-                from .router import _should_failover
                 if _should_failover(resp.status_code):
                     await resp.aclose()
                     logger.warning(
-                        "Stream upstream %r returned %d — trying next",
-                        ep.name, resp.status_code,
+                        "Stream upstream %r/%r returned %d — trying next step",
+                        ep.name, model_for_step, resp.status_code,
                     )
                     router.record_failure(ep, is_timeout=False)
                     attempts.append(AttemptLog(
@@ -430,45 +427,31 @@ async def _handle_stream(
                     continue
 
                 router.record_success(ep, latency_ms)
-                attempts.append(
-                    AttemptLog(
-                        endpoint_name=ep.name,
-                        latency_ms=latency_ms,
-                        success=True,
-                        is_timeout=False,
-                    )
-                )
-                return resp, ep, attempts
+                attempts.append(AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=True, is_timeout=False,
+                ))
+                return resp, step, attempts
             except _httpx.TimeoutException as exc:
                 latency_ms = (time.monotonic() - t0) * 1000
                 logger.warning("Stream timeout on %r: %s", ep.name, exc)
                 router.record_failure(ep, is_timeout=True)
-                attempts.append(
-                    AttemptLog(
-                        endpoint_name=ep.name,
-                        latency_ms=latency_ms,
-                        success=False,
-                        is_timeout=True,
-                        error_message=str(exc),
-                    )
-                )
+                attempts.append(AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=False, is_timeout=True, error_message=str(exc),
+                ))
             except Exception as exc:  # noqa: BLE001
                 latency_ms = (time.monotonic() - t0) * 1000
                 logger.warning("Stream error on %r: %s", ep.name, exc)
                 router.record_failure(ep, is_timeout=False)
-                attempts.append(
-                    AttemptLog(
-                        endpoint_name=ep.name,
-                        latency_ms=latency_ms,
-                        success=False,
-                        is_timeout=False,
-                        error_message=str(exc),
-                    )
-                )
+                attempts.append(AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=False, is_timeout=False, error_message=str(exc),
+                ))
         raise AllEndpointsFailedError(attempts)
 
     try:
-        upstream_resp, winning_ep, final_attempts = await _try_stream()
+        upstream_resp, winning_step, final_attempts = await _try_stream()
     except AllEndpointsFailedError as exc:
         total_ms = (time.monotonic() - t_start) * 1000
         log = RequestLog(
@@ -494,14 +477,13 @@ async def _handle_stream(
             log = RequestLog(
                 timestamp=time.time(),
                 model=model,
-                selected_endpoint=winning_ep.name,
+                selected_endpoint=winning_step.endpoint.name,
                 attempts=final_attempts,
                 status="success",
                 total_latency_ms=total_ms,
                 is_stream=True,
                 request_body=log_body,
             )
-            # Fire-and-forget DB write from a thread
             asyncio.get_event_loop().run_in_executor(
                 None, db.insert_request_log, log
             )
@@ -534,17 +516,18 @@ async def _handle_list_models(request: Request) -> JSONResponse:
     client: httpx.AsyncClient = request.app.state.client
     router: Router = request.app.state.router
 
-    # --- Section 2: routed models (from routing table) --------------------
+    # --- Section 2: named routes (config-defined chains + auto-discovered) --
     routed_models = router.get_routed_models()
     routed_entries = [
         {
-            "id": model_id,
+            "id": route_name,
             "object": "model",
             "created": int(_time.time()),
             "owned_by": "llm-proxy",
-            "x-routing": ep_names,  # extra metadata for tooling / dashboards
+            # x-routing shows each step as {server, model} for tooling/dashboards
+            "x-routing": chain,
         }
-        for model_id, ep_names in routed_models.items()
+        for route_name, chain in routed_models.items()
     ]
 
     # --- Section 3: direct {endpoint}/{model} entries (live fetch) -------

@@ -41,13 +41,18 @@ failover:
   circuit_breaker_cooldown: 30
   routing_strategy: "priority"
 
-# Per-model routing: override the global endpoint priority order per model.
-# Endpoints not listed here fall back to the global order (alpha → beta → gamma).
+# Named fallback chains — each appears as a selectable model in /v1/models.
+# Each step specifies which server to try AND which model to request on that server.
+# Steps are tried in order; failed/circuit-open steps are skipped automatically.
 routing:
-  - model: "gpt-4"
-    endpoints: ["alpha-timeout", "beta-flaky", "gamma-ok"]
-  - model: "mock-model"
-    endpoints: ["gamma-ok", "beta-flaky"]   # gamma first for mock-model
+  - name: "best-available"
+    chain:
+      - server: alpha-timeout
+        model: gpt-4
+      - server: beta-flaky
+        model: mock-model
+      - server: gamma-ok
+        model: mock-model
 
 logging:
   db_path: "./data/local-test.db"

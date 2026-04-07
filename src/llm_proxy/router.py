@@ -12,6 +12,7 @@ from .models import (
     CircuitState,
     EndpointState,
     EndpointStatus,
+    RouteStep,
     RoutingTable,
 )
 
@@ -22,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 def _should_failover(status_code: int) -> bool:
-    """Return True if an HTTP status code should trigger failover to next endpoint.
+    """Return True if an HTTP status code should trigger failover to the next step.
 
     5xx = server errors (worth retrying on another endpoint).
     429 = rate limited (try another endpoint).
@@ -34,7 +35,7 @@ def _should_failover(status_code: int) -> bool:
 class AllEndpointsFailedError(Exception):
     def __init__(self, attempts: list[AttemptLog]) -> None:
         self.attempts = attempts
-        super().__init__(f"All endpoints failed after {len(attempts)} attempt(s)")
+        super().__init__(f"All steps failed after {len(attempts)} attempt(s)")
 
 
 class Router:
@@ -54,8 +55,10 @@ class Router:
         """Build the initial routing table.
 
         Creates one EndpointState per endpoint (shared across all routing entries).
-        "*" wildcard covers all models by default.
-        Per-model routes from config.routing are applied on top.
+
+        Table layout:
+          "*"             — wildcard; step.model=None (inherit from request)
+          "<route-name>"  — named chain; each step has explicit (endpoint, model)
         """
         for ep in self._config.endpoints:
             self._ep_by_name[ep.name] = EndpointState(
@@ -66,23 +69,33 @@ class Router:
                 headers=ep.headers,
             )
 
+        # "*" wildcard: all endpoints sorted by priority, model inherited per-request
         all_states = sorted(self._ep_by_name.values(), key=lambda s: s.priority)
-        table: RoutingTable = {"*": all_states}
+        table: RoutingTable = {
+            "*": [RouteStep(ep, None) for ep in all_states]
+        }
 
         for route in self._config.routing:
-            eps = [self._ep_by_name[n] for n in route.endpoints if n in self._ep_by_name]
-            if eps:
-                table[route.model] = eps
-                logger.info(
-                    "Model routing (config): %r -> [%s]",
-                    route.model,
-                    ", ".join(e.name for e in eps),
-                )
-            else:
+            steps: list[RouteStep] = []
+            unknown: list[str] = []
+            for step_cfg in route.chain:
+                ep = self._ep_by_name.get(step_cfg.server)
+                if ep is not None:
+                    steps.append(RouteStep(ep, step_cfg.model))
+                else:
+                    unknown.append(step_cfg.server)
+
+            if unknown:
                 logger.warning(
-                    "Model routing rule for %r references unknown endpoint(s): %s",
-                    route.model,
-                    [n for n in route.endpoints if n not in self._ep_by_name],
+                    "Route %r references unknown endpoint(s): %s — those steps skipped",
+                    route.name, unknown,
+                )
+            if steps:
+                table[route.name] = steps
+                logger.info(
+                    "Named route %r: %s",
+                    route.name,
+                    " -> ".join(f"{s.endpoint.name}/{s.model}" for s in steps),
                 )
 
         return table
@@ -90,8 +103,10 @@ class Router:
     def update_routing_from_discovery(self, discovered: dict[str, list[str]]) -> None:
         """Merge auto-discovered model→endpoints into the routing table.
 
-        Only adds entries that are NOT already defined by config routing,
-        so config always takes precedence.
+        Only adds entries NOT already defined by config routing.
+        Auto-discovered routes use the same model name for every step
+        (since discovery confirms the endpoint supports that exact model).
+        Config-defined routes always take precedence.
 
         ``discovered`` maps model_id → [endpoint names in priority order].
         """
@@ -99,49 +114,66 @@ class Router:
         for model_id, ep_names in discovered.items():
             if model_id in self._table:
                 continue  # config-defined route wins
-            eps = [self._ep_by_name[n] for n in ep_names if n in self._ep_by_name]
-            if eps:
-                self._table[model_id] = eps
+            steps = [
+                RouteStep(self._ep_by_name[n], model_id)
+                for n in ep_names
+                if n in self._ep_by_name
+            ]
+            if steps:
+                self._table[model_id] = steps
                 added += 1
         if added:
             logger.info("Auto-discovery added %d model route(s)", added)
 
-    def get_routed_models(self) -> dict[str, list[str]]:
-        """Return non-wildcard routing entries as model → [endpoint names]."""
-        return {
-            model: [ep.name for ep in eps]
-            for model, eps in self._table.items()
-            if model != "*"
-        }
-
     # ------------------------------------------------------------------
-    # Candidate selection
+    # Route access
     # ------------------------------------------------------------------
 
-    def get_candidates(self, model: str) -> list[EndpointState]:
-        """Return an ordered list of endpoints eligible to handle this model.
+    def get_route(self, name: str) -> list[RouteStep]:
+        """Return the raw (unfiltered) step list for a route name.
 
-        Lookup order:
-          1. model-specific key (e.g. "gpt-4")
-          2. wildcard "*"
-
-        Endpoints whose circuit breaker is OPEN are skipped unless their
-        cooldown has expired, in which case they are transitioned to HALF_OPEN.
+        Returns the "*" wildcard list if ``name`` is not found.
         """
-        endpoints = self._table.get(model) or self._table.get("*") or []
+        return self._table.get(name) or self._table.get("*") or []
 
-        eligible: list[EndpointState] = []
-        for ep in endpoints:
-            state = self._maybe_transition_to_half_open(ep)
+    def filter_steps(self, steps: list[RouteStep]) -> list[RouteStep]:
+        """Remove circuit-OPEN steps; apply latency sort if configured."""
+        eligible: list[RouteStep] = []
+        for step in steps:
+            state = self._maybe_transition_to_half_open(step.endpoint)
             if state == "open":
-                logger.debug("Skipping %r — circuit OPEN", ep.name)
+                logger.debug("Skipping %r — circuit OPEN", step.endpoint.name)
                 continue
-            eligible.append(ep)
+            eligible.append(step)
 
         if self._failover.routing_strategy == "latency":
-            eligible = self._sort_by_latency(eligible)
-
+            eligible = sorted(
+                eligible,
+                key=lambda s: (
+                    s.endpoint.avg_latency_ms is None,
+                    s.endpoint.avg_latency_ms or 0,
+                ),
+            )
         return eligible
+
+    def get_routed_models(self) -> dict[str, list[dict[str, str]]]:
+        """Return named routes (non-wildcard) as name → chain description.
+
+        Each chain entry is {"server": ep_name, "model": model_id}.
+        """
+        result: dict[str, list[dict[str, str]]] = {}
+        for name, steps in self._table.items():
+            if name == "*":
+                continue
+            result[name] = [
+                {"server": s.endpoint.name, "model": s.model or ""}
+                for s in steps
+            ]
+        return result
+
+    # ------------------------------------------------------------------
+    # Circuit breaker helpers
+    # ------------------------------------------------------------------
 
     def _maybe_transition_to_half_open(self, ep: EndpointState) -> CircuitState:
         if ep.circuit_state == "open" and ep.open_since is not None:
@@ -156,23 +188,10 @@ class Router:
                 ep.open_since = None
         return ep.circuit_state
 
-    @staticmethod
-    def _sort_by_latency(endpoints: list[EndpointState]) -> list[EndpointState]:
-        """Sort by average latency; unknown-latency endpoints go last."""
-        return sorted(
-            endpoints,
-            key=lambda ep: (ep.avg_latency_ms is None, ep.avg_latency_ms or 0),
-        )
-
-    # ------------------------------------------------------------------
-    # Result recording
-    # ------------------------------------------------------------------
-
     def record_success(self, ep: EndpointState, latency_ms: float) -> None:
         ep.total_requests += 1
         ep.latency_samples.append(latency_ms)
         ep.consecutive_failures = 0
-
         if ep.circuit_state == "half_open":
             logger.info("Circuit breaker CLOSED for %r (probe succeeded)", ep.name)
             ep.circuit_state = "closed"
@@ -183,24 +202,16 @@ class Router:
         if is_timeout:
             ep.total_timeouts += 1
         ep.consecutive_failures += 1
-
         threshold = self._failover.circuit_breaker_threshold
 
         if ep.circuit_state == "half_open":
-            logger.warning(
-                "Circuit breaker OPEN for %r (probe failed)", ep.name
-            )
+            logger.warning("Circuit breaker OPEN for %r (probe failed)", ep.name)
             ep.circuit_state = "open"
             ep.open_since = time.monotonic()
-
-        elif (
-            ep.circuit_state == "closed"
-            and ep.consecutive_failures >= threshold
-        ):
+        elif ep.circuit_state == "closed" and ep.consecutive_failures >= threshold:
             logger.warning(
                 "Circuit breaker OPEN for %r (%d consecutive failures)",
-                ep.name,
-                ep.consecutive_failures,
+                ep.name, ep.consecutive_failures,
             )
             ep.circuit_state = "open"
             ep.open_since = time.monotonic()
@@ -210,24 +221,22 @@ class Router:
     # ------------------------------------------------------------------
 
     def get_status(self) -> list[EndpointStatus]:
-        seen: dict[str, EndpointStatus] = {}
-        for endpoints in self._table.values():
-            for ep in endpoints:
-                if ep.name not in seen:
-                    seen[ep.name] = EndpointStatus(
-                        name=ep.name,
-                        url=ep.url,
-                        priority=ep.priority,
-                        circuit_state=ep.circuit_state,
-                        consecutive_failures=ep.consecutive_failures,
-                        total_requests=ep.total_requests,
-                        total_failures=ep.total_failures,
-                        total_timeouts=ep.total_timeouts,
-                        avg_latency_ms=ep.avg_latency_ms,
-                        timeout_rate=ep.timeout_rate,
-                        failure_rate=ep.failure_rate,
-                    )
-        return list(seen.values())
+        return [
+            EndpointStatus(
+                name=ep.name,
+                url=ep.url,
+                priority=ep.priority,
+                circuit_state=ep.circuit_state,
+                consecutive_failures=ep.consecutive_failures,
+                total_requests=ep.total_requests,
+                total_failures=ep.total_failures,
+                total_timeouts=ep.total_timeouts,
+                avg_latency_ms=ep.avg_latency_ms,
+                timeout_rate=ep.timeout_rate,
+                failure_rate=ep.failure_rate,
+            )
+            for ep in sorted(self._ep_by_name.values(), key=lambda e: e.priority)
+        ]
 
     # ------------------------------------------------------------------
     # Lookup helpers
@@ -240,69 +249,7 @@ class Router:
         return list(self._ep_by_name.values())
 
     # ------------------------------------------------------------------
-    # Direct execution (single endpoint, no failover)
-    # ------------------------------------------------------------------
-
-    async def execute_direct(
-        self,
-        client: "httpx.AsyncClient",
-        ep: EndpointState,
-        path: str,
-        body: dict,
-        extra_headers: dict[str, str],
-    ) -> tuple["httpx.Response", list[AttemptLog]]:
-        """Send to a specific endpoint without failover.
-
-        Raises AllEndpointsFailedError if the single attempt fails.
-        """
-        import httpx as _httpx
-
-        headers = resolve_headers(ep.headers)
-        headers.update(extra_headers)
-        url = f"{ep.url}{path}"
-        timeout = ep.timeout_ms / 1000.0
-        t0 = time.monotonic()
-
-        try:
-            response = await client.post(url, json=body, headers=headers, timeout=timeout)
-            latency_ms = (time.monotonic() - t0) * 1000
-
-            if _should_failover(response.status_code):
-                logger.warning("Direct %r returned %d", ep.name, response.status_code)
-                self.record_failure(ep, is_timeout=False)
-                raise AllEndpointsFailedError([AttemptLog(
-                    endpoint_name=ep.name, latency_ms=latency_ms,
-                    success=False, is_timeout=False,
-                    error_message=f"HTTP {response.status_code}",
-                )])
-
-            self.record_success(ep, latency_ms)
-            attempts = [AttemptLog(
-                endpoint_name=ep.name, latency_ms=latency_ms,
-                success=True, is_timeout=False,
-            )]
-            return response, attempts
-
-        except _httpx.TimeoutException as exc:
-            latency_ms = (time.monotonic() - t0) * 1000
-            logger.warning("Direct timeout on %r: %s", ep.name, exc)
-            self.record_failure(ep, is_timeout=True)
-            raise AllEndpointsFailedError([AttemptLog(
-                endpoint_name=ep.name, latency_ms=latency_ms,
-                success=False, is_timeout=True, error_message=str(exc),
-            )])
-
-        except Exception as exc:  # noqa: BLE001
-            latency_ms = (time.monotonic() - t0) * 1000
-            logger.warning("Direct error on %r: %s", ep.name, exc)
-            self.record_failure(ep, is_timeout=False)
-            raise AllEndpointsFailedError([AttemptLog(
-                endpoint_name=ep.name, latency_ms=latency_ms,
-                success=False, is_timeout=False, error_message=str(exc),
-            )])
-
-    # ------------------------------------------------------------------
-    # Failover execution helper
+    # Failover execution (non-streaming)
     # ------------------------------------------------------------------
 
     async def execute(
@@ -311,29 +258,31 @@ class Router:
         path: str,
         body: dict,
         extra_headers: dict[str, str],
-    ) -> tuple["httpx.Response", EndpointState, list[AttemptLog]]:
-        """Attempt to forward a request through available endpoints.
+        steps: list[RouteStep],
+        fallback_model: str,
+    ) -> tuple["httpx.Response", RouteStep, list[AttemptLog]]:
+        """Try each RouteStep in order until one succeeds.
 
-        Returns (response, winning_endpoint_state, attempts_list).
-        Raises AllEndpointsFailedError if every candidate fails.
+        ``body`` must already contain all fields except model — we set the
+        model per step using ``step.model`` (or ``fallback_model`` when None).
 
-        This method is used for non-streaming requests.
-        For streaming, call execute_stream() instead.
+        Returns (response, winning_step, attempts).
+        Raises AllEndpointsFailedError if every step fails.
         """
         import httpx as _httpx
 
-        model: str = body.get("model", "*")
-        candidates = self.get_candidates(model)
-
-        if not candidates:
+        eligible = self.filter_steps(steps)
+        if not eligible:
             raise AllEndpointsFailedError([])
 
-        max_attempts = min(
-            len(candidates), self._failover.max_retries + 1
-        )
+        max_attempts = min(len(eligible), self._failover.max_retries + 1)
         attempts: list[AttemptLog] = []
 
-        for ep in candidates[:max_attempts]:
+        for step in eligible[:max_attempts]:
+            ep = step.endpoint
+            model_for_step = step.model or fallback_model
+            body_for_step = {**body, "model": model_for_step}
+
             headers = resolve_headers(ep.headers)
             headers.update(extra_headers)
             url = f"{ep.url}{path}"
@@ -341,18 +290,13 @@ class Router:
             t0 = time.monotonic()
 
             try:
-                response = await client.post(
-                    url,
-                    json=body,
-                    headers=headers,
-                    timeout=timeout,
-                )
+                response = await client.post(url, json=body_for_step, headers=headers, timeout=timeout)
                 latency_ms = (time.monotonic() - t0) * 1000
 
                 if _should_failover(response.status_code):
                     logger.warning(
-                        "Upstream %r returned %d — treating as failure",
-                        ep.name, response.status_code,
+                        "Upstream %r/%r returned %d — trying next step",
+                        ep.name, model_for_step, response.status_code,
                     )
                     self.record_failure(ep, is_timeout=False)
                     attempts.append(AttemptLog(
@@ -363,42 +307,28 @@ class Router:
                     continue
 
                 self.record_success(ep, latency_ms)
-                attempts.append(
-                    AttemptLog(
-                        endpoint_name=ep.name,
-                        latency_ms=latency_ms,
-                        success=True,
-                        is_timeout=False,
-                    )
-                )
-                return response, ep, attempts
+                attempts.append(AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=True, is_timeout=False,
+                ))
+                return response, step, attempts
 
             except _httpx.TimeoutException as exc:
                 latency_ms = (time.monotonic() - t0) * 1000
                 logger.warning("Timeout on %r (%.0fms): %s", ep.name, latency_ms, exc)
                 self.record_failure(ep, is_timeout=True)
-                attempts.append(
-                    AttemptLog(
-                        endpoint_name=ep.name,
-                        latency_ms=latency_ms,
-                        success=False,
-                        is_timeout=True,
-                        error_message=str(exc),
-                    )
-                )
+                attempts.append(AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=False, is_timeout=True, error_message=str(exc),
+                ))
 
             except Exception as exc:  # noqa: BLE001
                 latency_ms = (time.monotonic() - t0) * 1000
                 logger.warning("Error on %r: %s", ep.name, exc)
                 self.record_failure(ep, is_timeout=False)
-                attempts.append(
-                    AttemptLog(
-                        endpoint_name=ep.name,
-                        latency_ms=latency_ms,
-                        success=False,
-                        is_timeout=False,
-                        error_message=str(exc),
-                    )
-                )
+                attempts.append(AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=False, is_timeout=False, error_message=str(exc),
+                ))
 
         raise AllEndpointsFailedError(attempts)

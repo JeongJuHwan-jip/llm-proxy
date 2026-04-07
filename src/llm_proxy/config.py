@@ -69,16 +69,24 @@ class AuthConfig(BaseModel):
     api_keys: list[str] = Field(default_factory=list)
 
 
-class ModelRouteConfig(BaseModel):
-    """Explicit routing rule: which endpoints handle a model, in priority order."""
-    model: str
-    endpoints: list[str]  # endpoint names, first = highest priority
+class RouteStepConfig(BaseModel):
+    """One step in a named route: which server to try and which model to request."""
 
-    @field_validator("endpoints")
+    server: str   # must match an endpoint name
+    model: str    # model name sent to that server
+
+
+class RouteConfig(BaseModel):
+    """A named fallback chain exposed as a selectable model in /v1/models."""
+
+    name: str
+    chain: list[RouteStepConfig]
+
+    @field_validator("chain")
     @classmethod
-    def endpoints_not_empty(cls, v: list[str]) -> list[str]:
+    def chain_not_empty(cls, v: list[RouteStepConfig]) -> list[RouteStepConfig]:
         if not v:
-            raise ValueError("endpoints list must not be empty")
+            raise ValueError("chain must contain at least one step")
         return v
 
 
@@ -88,7 +96,7 @@ class ProxyConfig(BaseModel):
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     auth: AuthConfig | None = None
-    routing: list[ModelRouteConfig] = Field(default_factory=list)
+    routing: list[RouteConfig] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def check_endpoints_not_empty(self) -> "ProxyConfig":
