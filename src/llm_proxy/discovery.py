@@ -78,7 +78,7 @@ async def run_discovery(
     # model_id → [(priority, ep_name)]
     model_map: dict[str, list[tuple[int, str]]] = {}
 
-    async def _fetch(ep: "EndpointState") -> None:
+    async def _fetch(idx: int, ep: "EndpointState") -> None:
         try:
             headers = resolve_headers(ep.headers)
             resp = await client.get(
@@ -95,7 +95,7 @@ async def run_discovery(
                 endpoint_models[ep.name] = ids
                 endpoint_reachable[ep.name] = True
                 for mid in ids:
-                    model_map.setdefault(mid, []).append((ep.priority, ep.name))
+                    model_map.setdefault(mid, []).append((idx, ep.name))
                 return
         except Exception as exc:
             logger.debug("Discovery failed for %r: %s", ep.name, exc)
@@ -103,7 +103,7 @@ async def run_discovery(
         endpoint_models[ep.name] = []
         endpoint_reachable[ep.name] = False
 
-    await asyncio.gather(*[_fetch(ep) for ep in endpoints])
+    await asyncio.gather(*[_fetch(i, ep) for i, ep in enumerate(endpoints)])
 
     models = {
         mid: [name for _, name in sorted(eps)]

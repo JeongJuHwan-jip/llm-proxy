@@ -8,7 +8,7 @@
 # Then start the proxy:
 #   llm-proxy start --config config.local-test.yaml --port 9000
 
-server:
+proxy:
   host: "127.0.0.1"
   port: 9000
 
@@ -16,28 +16,24 @@ endpoints:
   - name: "alpha"
     url: "http://127.0.0.1:8001/v1"
     timeout_ms: 2000          # alpha hangs → times out in 2s → failover
-    priority: 1
     headers:
       X-Request-ID: "{{uuid}}"
 
   - name: "beta"
     url: "http://127.0.0.1:8002/v1"
     timeout_ms: 3000
-    priority: 2
 
   - name: "gamma"
     url: "http://127.0.0.1:8003/v1"
     timeout_ms: 5000
-    priority: 3
 
 failover:
   max_retries: 3
-  circuit_breaker_threshold: 3   # alpha opens circuit after 3 timeouts
+  circuit_breaker_threshold: 3
   circuit_breaker_cooldown: 30
   routing_strategy: "priority"
 
-# Named fallback chains — each appears as a selectable model in /v1/models.
-# Same endpoint can appear multiple times with different models.
+# Named fallback chains — edit routing.yaml instead for hot-reload.
 routing:
   - name: "best-available"
     chain:

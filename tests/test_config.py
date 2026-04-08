@@ -78,7 +78,7 @@ def _write_config(data: dict) -> Path:
 def test_load_minimal_config():
     cfg_data = {
         "endpoints": [
-            {"name": "alpha", "url": "https://alpha.example.com/v1", "priority": 1}
+            {"name": "alpha", "url": "https://alpha.example.com/v1", }
         ]
     }
     path = _write_config(cfg_data)
@@ -86,20 +86,19 @@ def test_load_minimal_config():
         cfg = load_config(path)
         assert len(cfg.endpoints) == 1
         assert cfg.endpoints[0].name == "alpha"
-        assert cfg.server.port == 8000  # default
+        assert cfg.proxy.port == 8000  # default
     finally:
         path.unlink()
 
 
 def test_load_full_config():
     cfg_data = {
-        "server": {"host": "0.0.0.0", "port": 9000},
+        "proxy": {"host": "0.0.0.0", "port": 9000},
         "endpoints": [
             {
                 "name": "ep1",
                 "url": "https://ep1.example.com/v1",
                 "timeout_ms": 3000,
-                "priority": 1,
                 "headers": {"X-Key": "val"},
             }
         ],
@@ -115,7 +114,7 @@ def test_load_full_config():
     path = _write_config(cfg_data)
     try:
         cfg = load_config(path)
-        assert cfg.server.port == 9000
+        assert cfg.proxy.port == 9000
         assert cfg.failover.routing_strategy == "latency"
         assert cfg.logging.log_request_body is True
         assert cfg.auth is not None
@@ -136,7 +135,7 @@ def test_load_config_no_endpoints_raises():
 
 def test_load_config_invalid_url_raises():
     cfg_data = {
-        "endpoints": [{"name": "bad", "url": "ftp://bad.example.com", "priority": 1}]
+        "endpoints": [{"name": "bad", "url": "ftp://bad.example.com", }]
     }
     path = _write_config(cfg_data)
     try:
@@ -150,7 +149,7 @@ def test_load_config_env_key(monkeypatch):
     monkeypatch.setenv("PROXY_KEY", "runtime-secret")
     cfg_data = {
         "endpoints": [
-            {"name": "ep", "url": "https://ep.example.com/v1", "priority": 1}
+            {"name": "ep", "url": "https://ep.example.com/v1", }
         ],
         "auth": {"api_keys": ["{{env:PROXY_KEY}}"]},
     }

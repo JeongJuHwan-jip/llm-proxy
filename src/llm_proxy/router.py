@@ -69,12 +69,11 @@ class Router:
                 name=ep.name,
                 url=ep.url,
                 timeout_ms=ep.timeout_ms,
-                priority=ep.priority,
                 headers=ep.headers,
             )
 
-        # "*" wildcard: all endpoints sorted by priority, model inherited per-request
-        all_states = sorted(self._ep_by_name.values(), key=lambda s: s.priority)
+        # "*" wildcard: all endpoints in config order, model inherited per-request
+        all_states = list(self._ep_by_name.values())
         table: RoutingTable = {
             "*": [RouteStep(ep, None) for ep in all_states]
         }
@@ -137,37 +136,17 @@ class Router:
                     " -> ".join(f"{s.endpoint.name}/{s.model}" for s in steps),
                 )
 
-        # Re-apply auto-discovered routes for models not covered by new config
-        if self._last_discovery:
-            self.update_routing_from_discovery(self._last_discovery)
-
         logger.info("Routing reloaded — %d named route(s)", len(self._table) - 1)
 
     def update_routing_from_discovery(self, discovered: dict[str, list[str]]) -> None:
-        """Merge auto-discovered model→endpoints into the routing table.
+        """Store the latest discovery results for informational use.
 
-        Only adds entries NOT already defined by config routing.
-        Auto-discovered routes use the same model name for every step
-        (since discovery confirms the endpoint supports that exact model).
-        Config-defined routes always take precedence.
-
-        ``discovered`` maps model_id → [endpoint names in priority order].
+        Discovery data is used by the ``/api/discovery`` endpoint and the
+        ``discover`` CLI command. It is NOT added to the routing table — only
+        explicitly configured named routes and ``endpoint/model`` direct
+        addressing appear in the table.
         """
         self._last_discovery = discovered
-        added = 0
-        for model_id, ep_names in discovered.items():
-            if model_id in self._table:
-                continue  # config-defined route wins
-            steps = [
-                RouteStep(self._ep_by_name[n], model_id)
-                for n in ep_names
-                if n in self._ep_by_name
-            ]
-            if steps:
-                self._table[model_id] = steps
-                added += 1
-        if added:
-            logger.info("Auto-discovery added %d model route(s)", added)
 
     # ------------------------------------------------------------------
     # Route access
@@ -269,7 +248,6 @@ class Router:
             EndpointStatus(
                 name=ep.name,
                 url=ep.url,
-                priority=ep.priority,
                 circuit_state=ep.circuit_state,
                 consecutive_failures=ep.consecutive_failures,
                 total_requests=ep.total_requests,
@@ -279,7 +257,7 @@ class Router:
                 timeout_rate=ep.timeout_rate,
                 failure_rate=ep.failure_rate,
             )
-            for ep in sorted(self._ep_by_name.values(), key=lambda e: e.priority)
+            for ep in self._ep_by_name.values()
         ]
 
     # ------------------------------------------------------------------

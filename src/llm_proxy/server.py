@@ -32,9 +32,6 @@ from .router import AllEndpointsFailedError, Router
 
 logger = logging.getLogger(__name__)
 
-# Special model ID that activates the full failover/circuit-breaker algorithm
-ROUTING_MODEL_ID = "llm-proxy/router"
-
 # Headers forwarded upstream — content-type is intentionally excluded:
 # httpx sets it automatically when using json=body, avoiding conflicts.
 _FORWARD_HEADERS = {"accept", "accept-encoding"}
@@ -276,7 +273,6 @@ def _register_routes(app: FastAPI) -> None:
 def _resolve_route(
     model_id: str,
     router: Router,
-    cfg: ProxyConfig,
 ) -> tuple[list[RouteStep], str]:
     """Resolve a client-supplied model ID into (steps, fallback_model).
 
@@ -284,23 +280,18 @@ def _resolve_route(
     ``fallback_model`` — model name used when a step has model=None (wildcard steps).
 
     Cases:
-      "llm-proxy/router"   → wildcard steps, fallback = cfg.failover.default_model
       "best-available"     → named route steps (each step has its own model)
       "alpha/gpt-4"        → single direct step: alpha endpoint with gpt-4
-      "gpt-4"              → auto-discovered route, or wildcard fallback with "gpt-4"
+      "gpt-4"              → wildcard fallback: try all endpoints with "gpt-4"
     """
-    # 1. Special routing model → full wildcard failover
-    if model_id == ROUTING_MODEL_ID:
-        return router.get_route("*"), cfg.failover.default_model
-
-    # 2. "endpoint_name/model" → single direct step
+    # 1. "endpoint_name/model" → single direct step
     if "/" in model_id:
         ep_name, _, actual_model = model_id.partition("/")
         ep = router.get_endpoint_by_name(ep_name)
         if ep is not None:
             return [RouteStep(ep, actual_model)], actual_model
 
-    # 3. Named route or auto-discovered model → use routing table
+    # 2. Named route or wildcard fallback
     steps = router.get_route(model_id)
     return steps, model_id
 
@@ -318,7 +309,7 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     raw_model: str = body.get("model", "unknown")
-    steps, fallback_model = _resolve_route(raw_model, router, cfg)
+    steps, fallback_model = _resolve_route(raw_model, router)
 
     is_stream: bool = bool(body.get("stream", False))
 
@@ -542,14 +533,11 @@ async def _handle_stream(
 # ---------------------------------------------------------------------------
 
 async def _handle_list_models(request: Request) -> JSONResponse:
-    """Return a merged model list.
+    """Return the model list.
 
     Response layout:
-      1. llm-proxy/router  — full failover across all endpoints
-      2. Per-model routed entries (from routing config or auto-discovery)
-         with x-routing metadata showing the endpoint priority order
-      3. Direct {endpoint}/{model} entries (bypass failover, go straight to
-         that endpoint) — fetched live from each upstream
+      1. {endpoint}/{model} — direct entries fetched live from each upstream
+      2. Named routes — config-defined fallback chains
     """
     import time as _time
     from .config import resolve_headers as _resolve
@@ -557,21 +545,7 @@ async def _handle_list_models(request: Request) -> JSONResponse:
     client: httpx.AsyncClient = request.app.state.client
     router: Router = request.app.state.router
 
-    # --- Section 2: named routes (config-defined chains + auto-discovered) --
-    routed_models = router.get_routed_models()
-    routed_entries = [
-        {
-            "id": route_name,
-            "object": "model",
-            "created": int(_time.time()),
-            "owned_by": "llm-proxy",
-            # x-routing shows each step as {server, model} for tooling/dashboards
-            "x-routing": chain,
-        }
-        for route_name, chain in routed_models.items()
-    ]
-
-    # --- Section 3: direct {endpoint}/{model} entries (live fetch) -------
+    # --- Section 1: endpoint/model direct entries (live fetch) ------------
     async def _fetch(ep: EndpointState) -> list[dict]:
         try:
             headers = _resolve(ep.headers)
@@ -589,29 +563,28 @@ async def _handle_list_models(request: Request) -> JSONResponse:
                 ]
         except Exception:
             pass
-        return [{
-            "id": ep.name,
-            "object": "model",
-            "created": int(_time.time()),
-            "owned_by": "llm-proxy",
-        }]
+        return []
 
     all_eps = router.all_endpoints()
     results = await asyncio.gather(*[_fetch(ep) for ep in all_eps])
     direct_entries = [m for models in results for m in models]
 
-    # --- Section 1: routing model -----------------------------------------
-    routing_entry = {
-        "id": ROUTING_MODEL_ID,
-        "object": "model",
-        "created": int(_time.time()),
-        "owned_by": "llm-proxy",
-        "x-routing": [ep.name for ep in router.all_endpoints()],
-    }
+    # --- Section 2: named routes ------------------------------------------
+    routed_models = router.get_routed_models()
+    route_entries = [
+        {
+            "id": route_name,
+            "object": "model",
+            "created": int(_time.time()),
+            "owned_by": "llm-proxy",
+            "x-routing": chain,
+        }
+        for route_name, chain in routed_models.items()
+    ]
 
     return JSONResponse({
         "object": "list",
-        "data": [routing_entry, *routed_entries, *direct_entries],
+        "data": [*direct_entries, *route_entries],
     })
 
 

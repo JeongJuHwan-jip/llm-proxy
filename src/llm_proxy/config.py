@@ -25,7 +25,7 @@ _SECRET_PATTERNS = re.compile(
 # ---------------------------------------------------------------------------
 
 
-class ServerConfig(BaseModel):
+class ProxyServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
 
@@ -36,7 +36,6 @@ class EndpointConfig(BaseModel):
     name: str
     url: str
     timeout_ms: int = Field(default=10000, gt=0)
-    priority: int = Field(default=1, ge=1)
     headers: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("url")
@@ -52,7 +51,6 @@ class FailoverConfig(BaseModel):
     circuit_breaker_threshold: int = Field(default=3, ge=1)
     circuit_breaker_cooldown: int = Field(default=60, ge=0)
     routing_strategy: str = "priority"  # "priority" | "latency"
-    default_model: str = "gpt-4"        # model name sent upstream when routing model is selected
 
     @field_validator("routing_strategy")
     @classmethod
@@ -101,7 +99,7 @@ class RouteConfig(BaseModel):
 
 
 class ProxyConfig(BaseModel):
-    server: ServerConfig = Field(default_factory=ServerConfig)
+    proxy: ProxyServerConfig = Field(default_factory=ProxyServerConfig)
     endpoints: list[EndpointConfig]
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)

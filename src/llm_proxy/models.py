@@ -18,7 +18,6 @@ class EndpointState:
     name: str
     url: str                              # base URL (no trailing slash)
     timeout_ms: int
-    priority: int
     headers: dict[str, str]              # raw headers (templates not yet resolved)
 
     # circuit breaker
@@ -100,7 +99,6 @@ class EndpointStatus:
 
     name: str
     url: str
-    priority: int
     circuit_state: CircuitState
     consecutive_failures: int
     total_requests: int

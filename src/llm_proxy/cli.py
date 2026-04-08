@@ -49,9 +49,9 @@ def start(config: str, host: str | None, port: int | None, workers: int) -> None
 
     cfg = load_config(config)
     if host is not None:
-        cfg.server.host = host
+        cfg.proxy.host = host
     if port is not None:
-        cfg.server.port = port
+        cfg.proxy.port = port
 
     # Inject config and config_path so the factory can pick them up
     from .server import create_app as _create_app
@@ -59,15 +59,15 @@ def start(config: str, host: str | None, port: int | None, workers: int) -> None
     _create_app._config_path = Path(config).resolve()  # type: ignore[attr-defined]
 
     click.echo(
-        f"Starting LLM Proxy on http://{cfg.server.host}:{cfg.server.port}  "
-        f"(dashboard: http://localhost:{cfg.server.port}/dashboard/index.html)"
+        f"Starting LLM Proxy on http://{cfg.proxy.host}:{cfg.proxy.port}  "
+        f"(dashboard: http://localhost:{cfg.proxy.port}/dashboard/index.html)"
     )
 
     uvicorn.run(
         "llm_proxy.server:create_app",
         factory=True,
-        host=cfg.server.host,
-        port=cfg.server.port,
+        host=cfg.proxy.host,
+        port=cfg.proxy.port,
         workers=workers,
         log_config=None,  # use our own logging config
         access_log=True,

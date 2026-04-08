@@ -9,7 +9,7 @@ import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 
-from llm_proxy.config import AuthConfig, EndpointConfig, FailoverConfig, LoggingConfig, ProxyConfig, ServerConfig
+from llm_proxy.config import AuthConfig, EndpointConfig, FailoverConfig, LoggingConfig, ProxyConfig, ProxyServerConfig
 from llm_proxy.server import create_app
 
 
@@ -21,13 +21,12 @@ from llm_proxy.server import create_app
 @pytest.fixture
 def config_no_auth() -> ProxyConfig:
     return ProxyConfig(
-        server=ServerConfig(host="127.0.0.1", port=8000),
+        proxy=ProxyServerConfig(host="127.0.0.1", port=8000),
         endpoints=[
             EndpointConfig(
                 name="mock-ep",
                 url="https://mock.example.com/v1",
                 timeout_ms=5000,
-                priority=1,
             )
         ],
         failover=FailoverConfig(max_retries=0, circuit_breaker_threshold=3),

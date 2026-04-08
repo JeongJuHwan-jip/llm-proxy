@@ -1,27 +1,34 @@
-server:
+# LLM Proxy — config.yaml
+#
+# This file is NOT tracked by git (personal per-deployment config).
+# Copy this to config.yaml and fill in your actual URLs / keys.
+
+# Proxy listening address — override at runtime with --host / --port flags.
+proxy:
   host: "0.0.0.0"
   port: 8000
 
+# Upstream LLM servers (connection info only — no model binding here).
+# Order matters: it determines the wildcard fallback order.
 endpoints:
-  - name: "llm-api-alpha"
-    url: "https://internal-alpha.company.com/v1"
+  - name: "alpha"
+    url: "https://alpha.company.com/v1"
     timeout_ms: 5000
-    priority: 1
     headers:
+      # {{uuid}}  → auto-generated UUID per request (NOT a placeholder you fill in)
+      # {{env:X}} → reads the environment variable X at runtime
       X-Request-ID: "{{uuid}}"
-      X-Service-Key: "fixed-value-123"
+      X-Service-Key: "my-fixed-key"
 
-  - name: "llm-api-beta"
-    url: "https://internal-beta.company.com/v1"
+  - name: "beta"
+    url: "https://beta.company.com/v1"
     timeout_ms: 8000
-    priority: 2
     headers:
       Authorization: "Bearer {{env:BETA_API_KEY}}"
 
-  - name: "llm-api-gamma"
-    url: "https://internal-gamma.company.com/v1"
+  - name: "gamma"
+    url: "https://gamma.company.com/v1"
     timeout_ms: 10000
-    priority: 3
 
 failover:
   max_retries: 2
@@ -29,11 +36,9 @@ failover:
   circuit_breaker_cooldown: 60
   routing_strategy: "priority"   # "priority" or "latency"
 
-# Routing file (not tracked by git — personal per-deployment config).
+# Routing file (not tracked by git).
 # Copy routing.example.yaml → routing.yaml and edit it.
-# The proxy auto-discovers routing.yaml next to this file; you can also
-# set an explicit path here.
-#
+# The proxy auto-discovers routing.yaml next to this file.
 # To reload routing at runtime without restarting:
 #   curl -X POST http://localhost:8000/api/routing/reload
 #
@@ -43,9 +48,9 @@ failover:
 # routing:
 #   - name: "best-available"
 #     chain:
-#       - endpoint: llm-api-alpha
+#       - endpoint: alpha
 #         model: gpt-4
-#       - endpoint: llm-api-beta
+#       - endpoint: beta
 #         model: llama-3-70b
 
 logging:
