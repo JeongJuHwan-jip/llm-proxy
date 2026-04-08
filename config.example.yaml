@@ -29,31 +29,24 @@ failover:
   circuit_breaker_cooldown: 60
   routing_strategy: "priority"   # "priority" or "latency"
 
-# Named fallback chains — each appears as a selectable model in /v1/models.
-# Each step specifies an endpoint (by name) + the model to request there.
-# The same endpoint can appear multiple times with different models;
-# all such steps share the endpoint's circuit-breaker state.
+# Routing file (not tracked by git — personal per-deployment config).
+# Copy routing.example.yaml → routing.yaml and edit it.
+# The proxy auto-discovers routing.yaml next to this file; you can also
+# set an explicit path here.
 #
-# Run `llm-proxy discover --config <file> --snippet` to auto-generate
-# a routing: block from live model discovery.
-routing:
-  - name: "best-available"
-    chain:
-      - endpoint: llm-api-alpha
-        model: gpt-4
-      - endpoint: llm-api-beta
-        model: llama-3-70b    # beta runs a different model
-      - endpoint: llm-api-gamma
-        model: mistral-7b     # gamma runs yet another model
+# To reload routing at runtime without restarting:
+#   curl -X POST http://localhost:8000/api/routing/reload
+#
+# routing_file: routing.yaml   # default: auto-discovered next to this file
 
-  - name: "gpt4-with-fallback"
-    chain:
-      - endpoint: llm-api-alpha
-        model: gpt-4
-      - endpoint: llm-api-beta
-        model: gpt-4
-      - endpoint: llm-api-alpha   # same endpoint, cheaper fallback model
-        model: gpt-3.5-turbo
+# Inline fallback (optional): used when routing.yaml is absent.
+# routing:
+#   - name: "best-available"
+#     chain:
+#       - endpoint: llm-api-alpha
+#         model: gpt-4
+#       - endpoint: llm-api-beta
+#         model: llama-3-70b
 
 logging:
   db_path: "./data/proxy.db"

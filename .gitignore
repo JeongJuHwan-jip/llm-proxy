@@ -25,6 +25,11 @@ data/
 .env
 *.env
 
+# Personal config & routing — not tracked; use *.example.yaml as templates
+config.yaml
+routing.yaml
+model_snapshot.json
+
 # IDE
 .vscode/
 .idea/

@@ -46,6 +46,8 @@ class Router:
         self._failover = config.failover
         self._ep_by_name: dict[str, EndpointState] = {}
         self._table: RoutingTable = self._build_routing_table()
+        # Last discovery result — kept so reload_routing() can re-apply it
+        self._last_discovery: dict[str, list[str]] = {}
 
     # ------------------------------------------------------------------
     # Table construction
@@ -102,6 +104,45 @@ class Router:
 
         return table
 
+    def reload_routing(self, routes: list) -> None:  # routes: list[RouteConfig]
+        """Hot-reload named routes without restarting.
+
+        Replaces all config-defined named routes, then re-applies the last
+        auto-discovery result so discovered model routes are preserved.
+        Circuit-breaker state for endpoints is never touched.
+        """
+        # Drop every named route (keep wildcard and auto-discovered will be re-added)
+        self._table = {"*": self._table["*"]}
+
+        # Apply new routes
+        for route in routes:
+            steps: list[RouteStep] = []
+            unknown: list[str] = []
+            for step_cfg in route.chain:
+                ep = self._ep_by_name.get(step_cfg.endpoint)
+                if ep is not None:
+                    steps.append(RouteStep(ep, step_cfg.model))
+                else:
+                    unknown.append(step_cfg.endpoint)
+            if unknown:
+                logger.warning(
+                    "Route %r references unknown endpoint(s): %s — steps skipped",
+                    route.name, unknown,
+                )
+            if steps:
+                self._table[route.name] = steps
+                logger.info(
+                    "Reloaded route %r: %s",
+                    route.name,
+                    " -> ".join(f"{s.endpoint.name}/{s.model}" for s in steps),
+                )
+
+        # Re-apply auto-discovered routes for models not covered by new config
+        if self._last_discovery:
+            self.update_routing_from_discovery(self._last_discovery)
+
+        logger.info("Routing reloaded — %d named route(s)", len(self._table) - 1)
+
     def update_routing_from_discovery(self, discovered: dict[str, list[str]]) -> None:
         """Merge auto-discovered model→endpoints into the routing table.
 
@@ -112,6 +153,7 @@ class Router:
 
         ``discovered`` maps model_id → [endpoint names in priority order].
         """
+        self._last_discovery = discovered
         added = 0
         for model_id, ep_names in discovered.items():
             if model_id in self._table:

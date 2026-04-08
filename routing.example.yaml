@@ -1,0 +1,33 @@
+# routing.yaml — copy this to routing.yaml and edit to suit your setup.
+#
+# This file is NOT tracked by git (personal per-deployment config).
+# The proxy loads it at startup and applies it over any routing: section
+# in config.yaml.  To reload at runtime without restarting the proxy:
+#
+#   curl -s -X POST http://localhost:9000/api/routing/reload | python -m json.tool
+#
+# Each entry becomes a selectable "model" in /v1/models.
+# Endpoint names must match those defined in config.yaml under endpoints:.
+# The same endpoint can appear multiple times with different models —
+# those steps share a single circuit-breaker state.
+#
+# Run `llm-proxy discover --config config.yaml --snippet` to auto-generate
+# this file from live model discovery.
+
+- name: "best-available"
+  chain:
+    - endpoint: alpha
+      model: gpt-4
+    - endpoint: beta
+      model: llama-3-70b
+    - endpoint: gamma
+      model: mistral-7b
+
+- name: "gpt4-with-fallback"
+  chain:
+    - endpoint: alpha
+      model: gpt-4
+    - endpoint: beta
+      model: gpt-4
+    - endpoint: alpha       # same endpoint, cheaper fallback model
+      model: gpt-3.5-turbo

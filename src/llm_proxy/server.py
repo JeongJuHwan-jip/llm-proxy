@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import ProxyConfig
+from .config import ProxyConfig, load_routing_file, resolve_routing_file
 from .database import Database
 from .discovery import (
     DiscoveryResult,
@@ -54,10 +54,12 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     if config is None:
         # config will be set on app.state before startup by the CLI
         config = getattr(create_app, "_config", None)
+    config_path_from_cli = getattr(create_app, "_config_path", None)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         cfg: ProxyConfig = app.state.config
+        config_path: Path | None = getattr(app.state, "config_path", None) or config_path_from_cli
 
         # HTTP client — shared connection pool
         limits = httpx.Limits(
@@ -76,6 +78,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.client = client
         app.state.router = router
         app.state.db = db
+
+        # ---- load routing file (overrides inline routing: in config) ----
+        routing_path = resolve_routing_file(
+            config_path or Path(cfg.logging.db_path),
+            cfg.routing_file,
+        )
+        app.state.routing_path = routing_path
+        if routing_path is not None and routing_path.exists():
+            try:
+                routes = load_routing_file(routing_path)
+                router.reload_routing(routes)
+                logger.info("Loaded routing from %s", routing_path)
+            except Exception as exc:
+                logger.warning("Could not load routing file %s: %s — using config routing", routing_path, exc)
+        # ------------------------------------------------------------
 
         # ---- model discovery & change detection ----
         snapshot_path = Path(cfg.logging.db_path).parent / "model_snapshot.json"
@@ -192,6 +209,30 @@ def _register_routes(app: FastAPI) -> None:
         loop = asyncio.get_event_loop()
         stats = await loop.run_in_executor(None, db.get_endpoint_stats)
         return JSONResponse(stats)
+
+    @app.post("/api/routing/reload")
+    async def api_routing_reload(request: Request) -> JSONResponse:
+        """Re-read routing.yaml and apply it live — no restart needed."""
+        router: Router = request.app.state.router
+        routing_path: Path | None = request.app.state.routing_path
+
+        if routing_path is None:
+            return JSONResponse(
+                {"error": "No routing file configured. Set routing_file in config or create routing.yaml next to it."},
+                status_code=400,
+            )
+        try:
+            routes = load_routing_file(routing_path)
+        except Exception as exc:
+            return JSONResponse({"error": f"Failed to read {routing_path}: {exc}"}, status_code=422)
+
+        router.reload_routing(routes)
+        routed = router.get_routed_models()
+        return JSONResponse({
+            "status": "reloaded",
+            "routing_file": str(routing_path),
+            "routes": list(routed.keys()),
+        })
 
     @app.get("/api/discovery")
     async def api_discovery(request: Request) -> JSONResponse:

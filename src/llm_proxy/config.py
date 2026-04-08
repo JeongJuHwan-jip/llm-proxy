@@ -106,7 +106,12 @@ class ProxyConfig(BaseModel):
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     auth: AuthConfig | None = None
+    # Inline routing — used when routing_file is absent or cannot be loaded.
     routing: list[RouteConfig] = Field(default_factory=list)
+    # Path to a separate routing file (relative to config dir or absolute).
+    # When set (or when routing.yaml exists next to config), that file takes
+    # precedence over the inline routing: section above.
+    routing_file: str | None = None
 
     @model_validator(mode="after")
     def check_endpoints_not_empty(self) -> "ProxyConfig":
@@ -168,6 +173,57 @@ def resolve_api_keys(keys: list[str]) -> list[str]:
     return [_TEMPLATE_ENV.sub(
         lambda m: os.environ.get(m.group(1).strip(), ""), k
     ) for k in keys]
+
+
+# ---------------------------------------------------------------------------
+# Routing file helpers
+# ---------------------------------------------------------------------------
+
+
+def load_routing_file(path: str | Path) -> list[RouteConfig]:
+    """Load a standalone routing YAML file (a list of route configs).
+
+    The file contains the same structure as the ``routing:`` section of config.yaml:
+
+    .. code-block:: yaml
+
+        - name: "best-available"
+          chain:
+            - endpoint: alpha
+              model: gpt-4
+            - endpoint: beta
+              model: llama-3
+
+    Returns an empty list if the file does not exist.
+    Raises ValueError on parse errors so the caller can decide to fall back.
+    """
+    path = Path(path)
+    if not path.exists():
+        return []
+    with path.open("r", encoding="utf-8") as f:
+        raw = yaml.safe_load(f)
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(f"Routing file must be a YAML list, got {type(raw).__name__}: {path}")
+    return [RouteConfig.model_validate(item) for item in raw]
+
+
+def resolve_routing_file(config_path: Path, routing_file: str | None) -> Path | None:
+    """Return the resolved path to the routing file, or None if not applicable.
+
+    Resolution order:
+    1. Explicit ``routing_file`` value in config (relative → resolved against config dir).
+    2. ``routing.yaml`` next to the config file (auto-discovery).
+    """
+    if routing_file:
+        p = Path(routing_file)
+        if not p.is_absolute():
+            p = config_path.parent / p
+        return p
+    # Auto-discover routing.yaml next to config
+    candidate = config_path.parent / "routing.yaml"
+    return candidate if candidate.exists() else None
 
 
 # ---------------------------------------------------------------------------

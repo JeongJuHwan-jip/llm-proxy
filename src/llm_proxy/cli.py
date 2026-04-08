@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 import click
 import uvicorn
@@ -52,9 +53,10 @@ def start(config: str, host: str | None, port: int | None, workers: int) -> None
     if port is not None:
         cfg.server.port = port
 
-    # Inject config so the factory can pick it up
+    # Inject config and config_path so the factory can pick them up
     from .server import create_app as _create_app
-    _create_app._config = cfg  # type: ignore[attr-defined]
+    _create_app._config = cfg          # type: ignore[attr-defined]
+    _create_app._config_path = Path(config).resolve()  # type: ignore[attr-defined]
 
     click.echo(
         f"Starting LLM Proxy on http://{cfg.server.host}:{cfg.server.port}  "
