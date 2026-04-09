@@ -28,6 +28,14 @@ _SECRET_PATTERNS = re.compile(
 class ProxyServerConfig(BaseModel):
     host: str = "0.0.0.0"
     port: int = 8000
+    header_priority: str = "config"  # "config" | "client"
+
+    @field_validator("header_priority")
+    @classmethod
+    def validate_header_priority(cls, v: str) -> str:
+        if v not in ("config", "client"):
+            raise ValueError("header_priority must be 'config' or 'client'")
+        return v
 
 
 class EndpointConfig(BaseModel):

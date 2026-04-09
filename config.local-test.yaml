@@ -11,6 +11,7 @@
 proxy:
   host: "127.0.0.1"
   port: 9000
+  header_priority: "client"
 
 endpoints:
   - name: "alpha"
@@ -18,6 +19,7 @@ endpoints:
     timeout_ms: 2000          # alpha hangs → times out in 2s → failover
     headers:
       X-Request-ID: "{{uuid}}"
+      x-title: "Roo Codes"
 
   - name: "beta"
     url: "http://127.0.0.1:8002/v1"

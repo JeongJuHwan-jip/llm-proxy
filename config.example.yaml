@@ -7,6 +7,9 @@
 proxy:
   host: "0.0.0.0"
   port: 8000
+  # When a client-sent header conflicts with an endpoint's config header,
+  # which one wins?  "config" (default) or "client"
+  header_priority: "config"
 
 # Upstream LLM servers (connection info only — no model binding here).
 # Order matters: it determines the wildcard fallback order.
@@ -30,11 +33,27 @@ endpoints:
     url: "https://gamma.company.com/v1"
     timeout_ms: 10000
 
+# Failover — controls how the routing chain handles failures.
+# Only applies to named routes (routing.yaml chains), not direct endpoint/model requests.
 failover:
+  # Max number of retry attempts per request.
+  # e.g. 2 → try up to 3 steps total (1 initial + 2 retries) from the chain.
   max_retries: 2
+
+  # How many consecutive failures (across different requests) before
+  # an endpoint is temporarily taken out of rotation ("circuit open").
+  # e.g. 3 → if alpha fails 3 requests in a row, skip it until cooldown expires.
   circuit_breaker_threshold: 3
+
+  # Seconds to wait before retrying a circuit-opened endpoint.
+  # After cooldown, the endpoint enters "half-open" — one test request is sent.
+  # Success → back to normal ("closed"). Failure → open again for another cooldown.
   circuit_breaker_cooldown: 60
-  routing_strategy: "priority"   # "priority" or "latency"
+
+  # How to pick the next step when multiple are eligible.
+  #   "priority" — follow the chain order as written
+  #   "latency"  — prefer the endpoint with the lowest recent latency
+  routing_strategy: "priority"
 
 # Routing file (not tracked by git).
 # Copy routing.example.yaml → routing.yaml and edit it.

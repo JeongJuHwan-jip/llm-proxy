@@ -32,10 +32,59 @@ from .router import AllEndpointsFailedError, Router
 
 logger = logging.getLogger(__name__)
 
-# Headers forwarded upstream — content-type is intentionally excluded:
-# httpx sets it automatically when using json=body, avoiding conflicts.
-_FORWARD_HEADERS = {"accept", "accept-encoding"}
-_STRIP_HEADERS = {"host", "content-length", "transfer-encoding", "connection"}
+
+# ---------------------------------------------------------------------------
+# SSE event broadcaster — dashboard subscribes to this
+# ---------------------------------------------------------------------------
+
+class EventBroadcaster:
+    """Lightweight pub/sub for SSE. Each dashboard tab holds one asyncio.Queue."""
+
+    def __init__(self) -> None:
+        self._subscribers: set[asyncio.Queue[str]] = set()
+
+    def subscribe(self) -> asyncio.Queue[str]:
+        q: asyncio.Queue[str] = asyncio.Queue(maxsize=32)
+        self._subscribers.add(q)
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue[str]) -> None:
+        self._subscribers.discard(q)
+
+    def publish(self, event: str = "refresh") -> None:
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                pass  # slow consumer — skip
+
+
+# Headers that must NOT be forwarded to upstream (hop-by-hop / set by httpx)
+_STRIP_HEADERS = {
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "authorization",  # proxy auth — endpoint headers handle upstream auth
+}
+
+
+def merge_headers(
+    config_headers: dict[str, str],
+    client_headers: dict[str, str],
+    priority: str,
+) -> dict[str, str]:
+    """Merge endpoint config headers with client-forwarded headers.
+
+    ``priority`` controls which side wins on key conflicts:
+      - "config": config headers overwrite client headers (default)
+      - "client": client headers overwrite config headers
+    """
+    if priority == "client":
+        merged = {**config_headers, **client_headers}
+    else:
+        merged = {**client_headers, **config_headers}
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +124,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.client = client
         app.state.router = router
         app.state.db = db
+        app.state.events = EventBroadcaster()
 
         # ---- load routing file (overrides inline routing: in config) ----
         routing_path = resolve_routing_file(
@@ -256,6 +306,29 @@ def _register_routes(app: FastAPI) -> None:
             "diff": diff_payload,
         })
 
+    # ---------------------------------------------------------------- SSE
+    @app.get("/api/events")
+    async def api_events(request: Request) -> StreamingResponse:
+        """SSE stream — sends 'refresh' whenever a proxy request completes."""
+        broadcaster: EventBroadcaster = request.app.state.events
+        q = broadcaster.subscribe()
+
+        async def event_stream() -> AsyncIterator[str]:
+            try:
+                while True:
+                    event = await q.get()
+                    yield f"data: {event}\n\n"
+            except asyncio.CancelledError:
+                pass
+            finally:
+                broadcaster.unsubscribe(q)
+
+        return StreamingResponse(
+            event_stream(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
     # ---------------------------------------------------------------- root
     @app.get("/")
     async def root() -> RedirectResponse:
@@ -317,26 +390,32 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
     forward_headers: dict[str, str] = {
         k: v
         for k, v in request.headers.items()
-        if k.lower() in _FORWARD_HEADERS and k.lower() not in _STRIP_HEADERS
+        if k.lower() not in _STRIP_HEADERS
     }
 
     t_start = time.monotonic()
     log_body = body if cfg.logging.log_request_body else None
 
+    events: EventBroadcaster = request.app.state.events
+
     if is_stream:
         return await _handle_stream(
-            client, router, db, cfg,
+            client, router, db, cfg, events,
             upstream_path, body, forward_headers,
             raw_model, log_body, t_start,
             steps=steps, fallback_model=fallback_model,
         )
     else:
-        return await _handle_normal(
-            client, router, db, cfg,
-            upstream_path, body, forward_headers,
-            raw_model, log_body, t_start,
-            steps=steps, fallback_model=fallback_model,
-        )
+        try:
+            result = await _handle_normal(
+                client, router, db, cfg,
+                upstream_path, body, forward_headers,
+                raw_model, log_body, t_start,
+                steps=steps, fallback_model=fallback_model,
+            )
+        finally:
+            events.publish()
+        return result
 
 
 async def _handle_normal(
@@ -398,6 +477,7 @@ async def _handle_stream(
     router: Router,
     db: Database,
     cfg: ProxyConfig,
+    events: EventBroadcaster,
     path: str,
     body: dict,
     extra_headers: dict[str, str],
@@ -427,10 +507,15 @@ async def _handle_stream(
             model_for_step = step.model or fallback_model
             body_for_step = {**body, "model": model_for_step}
 
-            headers = _resolve(ep.headers)
-            headers.update(extra_headers)
+            headers = merge_headers(
+                _resolve(ep.headers), extra_headers, cfg.proxy.header_priority,
+            )
             url = f"{ep.url}{path}"
             timeout = ep.timeout_ms / 1000.0
+            logger.debug(
+                "Upstream request → %s  headers=%s  model=%s",
+                url, headers, model_for_step,
+            )
             t0 = time.monotonic()
             try:
                 # httpx >=0.20: timeout must be in request extensions, not send()
@@ -497,6 +582,7 @@ async def _handle_stream(
             request_body=log_body,
         )
         await loop.run_in_executor(None, db.insert_request_log, log)
+        events.publish()
         raise HTTPException(status_code=502, detail="All upstream endpoints failed")
 
     async def byte_generator() -> AsyncIterator[bytes]:
@@ -519,6 +605,7 @@ async def _handle_stream(
             asyncio.get_event_loop().run_in_executor(
                 None, db.insert_request_log, log
             )
+            events.publish()
 
     return StreamingResponse(
         byte_generator(),
@@ -566,8 +653,10 @@ async def _handle_list_models(request: Request) -> JSONResponse:
         return []
 
     all_eps = router.all_endpoints()
+    # gather preserves input order → results[i] corresponds to all_eps[i]
     results = await asyncio.gather(*[_fetch(ep) for ep in all_eps])
-    direct_entries = [m for models in results for m in models]
+    # Flatten in endpoint config order (not by response arrival time)
+    direct_entries = [m for ep_models in results for m in ep_models]
 
     # --- Section 2: named routes ------------------------------------------
     routed_models = router.get_routed_models()
@@ -604,8 +693,15 @@ async def _handle_passthrough(request: Request, upstream_path: str) -> Response:
         raise HTTPException(status_code=502, detail="No endpoints available")
 
     ep = candidates[0].endpoint
+    cfg: ProxyConfig = request.app.state.config
     from .config import resolve_headers as _resolve
-    headers = _resolve(ep.headers)
+    client_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _STRIP_HEADERS
+    }
+    headers = merge_headers(
+        _resolve(ep.headers), client_headers, cfg.proxy.header_priority,
+    )
     url = f"{ep.url}{upstream_path}"
 
     # Read body only for methods that can carry one

@@ -1,9 +1,10 @@
 'use strict';
 
-const REFRESH_INTERVAL = 30; // seconds
+const FALLBACK_INTERVAL = 30; // seconds — used only when SSE is disconnected
 
-let countdown = REFRESH_INTERVAL;
-let timer = null;
+let countdown = FALLBACK_INTERVAL;
+let fallbackTimer = null;
+let sseConnected = false;
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -49,9 +50,6 @@ function renderEndpoints(statuses) {
     container.innerHTML = '<p class="loading">No endpoints configured.</p>';
     return;
   }
-
-  // Sort by priority
-  statuses.sort((a, b) => a.priority - b.priority);
 
   container.innerHTML = '';
   for (const s of statuses) {
@@ -125,7 +123,7 @@ function escHtml(str) {
     .replace(/>/g, '&gt;');
 }
 
-// ── Main refresh loop ────────────────────────────────────────────────────────
+// ── Refresh ─────────────────────────────────────────────────────────────────
 
 async function refresh() {
   try {
@@ -140,24 +138,64 @@ async function refresh() {
   }
 }
 
-function startCountdown() {
-  countdown = REFRESH_INTERVAL;
-  clearInterval(timer);
-  timer = setInterval(() => {
+// ── SSE (real-time updates) ─────────────────────────────────────────────────
+
+function connectSSE() {
+  const source = new EventSource('/api/events');
+
+  source.onopen = () => {
+    sseConnected = true;
+    stopFallbackTimer();
+    updateConnectionStatus();
+  };
+
+  source.onmessage = () => {
+    refresh();
+  };
+
+  source.onerror = () => {
+    sseConnected = false;
+    source.close();
+    updateConnectionStatus();
+    startFallbackTimer();
+    // Reconnect after 3 seconds
+    setTimeout(connectSSE, 3000);
+  };
+}
+
+// ── Fallback polling (when SSE is disconnected) ─────────────────────────────
+
+function startFallbackTimer() {
+  if (fallbackTimer) return;
+  countdown = FALLBACK_INTERVAL;
+  fallbackTimer = setInterval(() => {
     countdown -= 1;
     document.getElementById('countdown').textContent = countdown;
     if (countdown <= 0) {
       refresh();
-      countdown = REFRESH_INTERVAL;
+      countdown = FALLBACK_INTERVAL;
     }
   }, 1000);
 }
 
-document.getElementById('btn-refresh').addEventListener('click', () => {
-  refresh();
-  startCountdown();
-});
+function stopFallbackTimer() {
+  if (fallbackTimer) {
+    clearInterval(fallbackTimer);
+    fallbackTimer = null;
+  }
+}
 
-// Initial load
+function updateConnectionStatus() {
+  const el = document.getElementById('refresh-info');
+  if (sseConnected) {
+    el.innerHTML = 'Live <button id="btn-refresh">Refresh now</button>';
+  } else {
+    el.innerHTML = 'Reconnecting... fallback poll: <span id="countdown">30</span>s <button id="btn-refresh">Refresh now</button>';
+  }
+  document.getElementById('btn-refresh').addEventListener('click', () => refresh());
+}
+
+// ── Init ────────────────────────────────────────────────────────────────────
+
 refresh();
-startCountdown();
+connectSSE();

@@ -305,8 +305,11 @@ class Router:
             model_for_step = step.model or fallback_model
             body_for_step = {**body, "model": model_for_step}
 
-            headers = resolve_headers(ep.headers)
-            headers.update(extra_headers)
+            from .server import merge_headers
+            headers = merge_headers(
+                resolve_headers(ep.headers), extra_headers,
+                self._config.proxy.header_priority,
+            )
             url = f"{ep.url}{path}"
             timeout = ep.timeout_ms / 1000.0
             t0 = time.monotonic()
