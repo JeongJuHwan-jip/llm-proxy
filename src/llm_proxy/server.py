@@ -350,13 +350,12 @@ def _resolve_route(
     """Resolve a client-supplied model ID into (steps, fallback_model, is_direct).
 
     ``steps``          — ordered list of (endpoint, model) pairs to attempt.
-    ``fallback_model`` — model name used when a step has model=None (wildcard steps).
+    ``fallback_model`` — model name used when a step has model=None.
     ``is_direct``      — True for direct endpoint/model requests (no failover/CB).
 
     Cases:
       "best-available"     → named route steps (each step has its own model)
       "alpha/gpt-4"        → single direct step: alpha endpoint with gpt-4
-      "gpt-4"              → wildcard fallback: try all endpoints with "gpt-4"
     """
     # 1. "endpoint_name/model" → single direct step (no circuit breaker)
     if "/" in model_id:
@@ -365,8 +364,13 @@ def _resolve_route(
         if ep is not None:
             return [RouteStep(ep, actual_model)], actual_model, True
 
-    # 2. Named route or wildcard fallback
+    # 2. Named route only
     steps = router.get_route(model_id)
+    if not steps:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown model {model_id!r}. Use 'endpoint/model' or a named route.",
+        )
     return steps, model_id, False
 
 
@@ -701,11 +705,11 @@ async def _handle_passthrough(request: Request, upstream_path: str) -> Response:
     client: httpx.AsyncClient = request.app.state.client
     router: Router = request.app.state.router
 
-    candidates = router.filter_steps(router.get_route("*"))
-    if not candidates:
+    all_eps = router.all_endpoints()
+    if not all_eps:
         raise HTTPException(status_code=502, detail="No endpoints available")
 
-    ep = candidates[0].endpoint
+    ep = all_eps[0]
     cfg: ProxyConfig = request.app.state.config
     from .config import resolve_headers as _resolve
     client_headers = {

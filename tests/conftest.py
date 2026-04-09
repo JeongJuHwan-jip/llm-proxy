@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from llm_proxy.config import EndpointConfig, FailoverConfig, LoggingConfig, ProxyConfig, ProxyServerConfig
+from llm_proxy.config import EndpointConfig, FailoverConfig, LoggingConfig, ProxyConfig, ProxyServerConfig, RouteConfig, RouteStepConfig
 
 
 @pytest.fixture
@@ -32,4 +32,13 @@ def minimal_config() -> ProxyConfig:
             routing_strategy="priority",
         ),
         logging=LoggingConfig(db_path=":memory:", log_request_body=False),
+        routing=[
+            RouteConfig(
+                name="test-route",
+                chain=[
+                    RouteStepConfig(endpoint="alpha", model="gpt-4"),
+                    RouteStepConfig(endpoint="beta", model="gpt-4"),
+                ],
+            ),
+        ],
     )

@@ -61,7 +61,6 @@ class Router:
         chain with different models — those steps share a single circuit-breaker state.
 
         Table layout:
-          "*"             — wildcard; step.model=None (inherit from request)
           "<route-name>"  — named chain; each step carries explicit (endpoint, model)
         """
         for ep in self._config.endpoints:
@@ -72,11 +71,7 @@ class Router:
                 headers=ep.headers,
             )
 
-        # "*" wildcard: all endpoints in config order, model inherited per-request
-        all_states = list(self._ep_by_name.values())
-        table: RoutingTable = {
-            "*": [RouteStep(ep, None) for ep in all_states]
-        }
+        table: RoutingTable = {}
 
         for route in self._config.routing:
             steps: list[RouteStep] = []
@@ -110,8 +105,8 @@ class Router:
         auto-discovery result so discovered model routes are preserved.
         Circuit-breaker state for endpoints is never touched.
         """
-        # Drop every named route (keep wildcard and auto-discovered will be re-added)
-        self._table = {"*": self._table["*"]}
+        # Drop all named routes — rebuilt below
+        self._table = {}
 
         # Apply new routes
         for route in routes:
@@ -136,7 +131,7 @@ class Router:
                     " -> ".join(f"{s.endpoint.name}/{s.model}" for s in steps),
                 )
 
-        logger.info("Routing reloaded — %d named route(s)", len(self._table) - 1)
+        logger.info("Routing reloaded — %d named route(s)", len(self._table))
 
     def update_routing_from_discovery(self, discovered: dict[str, list[str]]) -> None:
         """Store the latest discovery results for informational use.
@@ -155,9 +150,9 @@ class Router:
     def get_route(self, name: str) -> list[RouteStep]:
         """Return the raw (unfiltered) step list for a route name.
 
-        Returns the "*" wildcard list if ``name`` is not found.
+        Returns an empty list if ``name`` is not found.
         """
-        return self._table.get(name) or self._table.get("*") or []
+        return self._table.get(name, [])
 
     def filter_steps(self, steps: list[RouteStep]) -> list[RouteStep]:
         """Remove circuit-OPEN steps; apply latency sort if configured."""
@@ -180,14 +175,12 @@ class Router:
         return eligible
 
     def get_routed_models(self) -> dict[str, list[dict[str, str]]]:
-        """Return named routes (non-wildcard) as name → chain description.
+        """Return named routes as name → chain description.
 
         Each chain entry is {"server": ep_name, "model": model_id}.
         """
         result: dict[str, list[dict[str, str]]] = {}
         for name, steps in self._table.items():
-            if name == "*":
-                continue
             result[name] = [
                 {"server": s.endpoint.name, "model": s.model or ""}
                 for s in steps

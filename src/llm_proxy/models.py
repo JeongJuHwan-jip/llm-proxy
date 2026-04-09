@@ -57,18 +57,14 @@ class RouteStep:
     """One step in a named route: the endpoint to try and the model to request.
 
     ``model`` is the model name sent to this specific endpoint.
-    When None (only used for the "*" wildcard), the caller should substitute
-    the model name from the incoming request.
     """
 
     endpoint: EndpointState
-    model: str | None  # None → inherit from the incoming request
+    model: str | None
 
 
 # RoutingTable maps route-name → ordered list of RouteStep.
-#   "*"              — wildcard fallback; step.model is always None
 #   "best-available" — named route; each step carries its own (endpoint, model)
-#   "gpt-4"          — auto-discovered; every step uses model="gpt-4"
 RoutingTable = dict[str, list[RouteStep]]
 
 
