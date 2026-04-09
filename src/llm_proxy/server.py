@@ -346,27 +346,28 @@ def _register_routes(app: FastAPI) -> None:
 def _resolve_route(
     model_id: str,
     router: Router,
-) -> tuple[list[RouteStep], str]:
-    """Resolve a client-supplied model ID into (steps, fallback_model).
+) -> tuple[list[RouteStep], str, bool]:
+    """Resolve a client-supplied model ID into (steps, fallback_model, is_direct).
 
     ``steps``          — ordered list of (endpoint, model) pairs to attempt.
     ``fallback_model`` — model name used when a step has model=None (wildcard steps).
+    ``is_direct``      — True for direct endpoint/model requests (no failover/CB).
 
     Cases:
       "best-available"     → named route steps (each step has its own model)
       "alpha/gpt-4"        → single direct step: alpha endpoint with gpt-4
       "gpt-4"              → wildcard fallback: try all endpoints with "gpt-4"
     """
-    # 1. "endpoint_name/model" → single direct step
+    # 1. "endpoint_name/model" → single direct step (no circuit breaker)
     if "/" in model_id:
         ep_name, _, actual_model = model_id.partition("/")
         ep = router.get_endpoint_by_name(ep_name)
         if ep is not None:
-            return [RouteStep(ep, actual_model)], actual_model
+            return [RouteStep(ep, actual_model)], actual_model, True
 
     # 2. Named route or wildcard fallback
     steps = router.get_route(model_id)
-    return steps, model_id
+    return steps, model_id, False
 
 
 async def _handle_proxy(request: Request, upstream_path: str) -> Response:
@@ -382,7 +383,7 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     raw_model: str = body.get("model", "unknown")
-    steps, fallback_model = _resolve_route(raw_model, router)
+    steps, fallback_model, is_direct = _resolve_route(raw_model, router)
 
     is_stream: bool = bool(body.get("stream", False))
 
@@ -404,6 +405,7 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
             upstream_path, body, forward_headers,
             raw_model, log_body, t_start,
             steps=steps, fallback_model=fallback_model,
+            is_direct=is_direct,
         )
     else:
         try:
@@ -412,6 +414,7 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
                 upstream_path, body, forward_headers,
                 raw_model, log_body, t_start,
                 steps=steps, fallback_model=fallback_model,
+                is_direct=is_direct,
             )
         finally:
             events.publish()
@@ -431,11 +434,13 @@ async def _handle_normal(
     t_start: float,
     steps: list[RouteStep],
     fallback_model: str,
+    is_direct: bool = False,
 ) -> Response:
     loop = asyncio.get_event_loop()
     try:
         response, winning_step, attempts = await router.execute(
             client, path, body, extra_headers, steps, fallback_model,
+            is_direct=is_direct,
         )
     except AllEndpointsFailedError as exc:
         total_ms = (time.monotonic() - t_start) * 1000
@@ -486,13 +491,17 @@ async def _handle_stream(
     t_start: float,
     steps: list[RouteStep],
     fallback_model: str,
+    is_direct: bool = False,
 ) -> StreamingResponse:
     from .config import resolve_headers as _resolve
     from .router import _should_failover
 
     loop = asyncio.get_event_loop()
 
-    eligible = router.filter_steps(steps)
+    if is_direct:
+        eligible = steps
+    else:
+        eligible = router.filter_steps(steps)
     if not eligible:
         raise HTTPException(status_code=502, detail="No endpoints available")
 
@@ -535,7 +544,8 @@ async def _handle_stream(
                         "Stream upstream %r/%r returned %d — trying next step",
                         ep.name, model_for_step, resp.status_code,
                     )
-                    router.record_failure(ep, is_timeout=False)
+                    if not is_direct:
+                        router.record_failure(ep, is_timeout=False)
                     attempts.append(AttemptLog(
                         endpoint_name=ep.name, latency_ms=latency_ms,
                         success=False, is_timeout=False,
@@ -543,7 +553,8 @@ async def _handle_stream(
                     ))
                     continue
 
-                router.record_success(ep, latency_ms)
+                if not is_direct:
+                    router.record_success(ep, latency_ms)
                 attempts.append(AttemptLog(
                     endpoint_name=ep.name, latency_ms=latency_ms,
                     success=True, is_timeout=False,
@@ -552,7 +563,8 @@ async def _handle_stream(
             except _httpx.TimeoutException as exc:
                 latency_ms = (time.monotonic() - t0) * 1000
                 logger.warning("Stream timeout on %r: %s", ep.name, exc)
-                router.record_failure(ep, is_timeout=True)
+                if not is_direct:
+                    router.record_failure(ep, is_timeout=True)
                 attempts.append(AttemptLog(
                     endpoint_name=ep.name, latency_ms=latency_ms,
                     success=False, is_timeout=True, error_message=str(exc),
@@ -560,7 +572,8 @@ async def _handle_stream(
             except Exception as exc:  # noqa: BLE001
                 latency_ms = (time.monotonic() - t0) * 1000
                 logger.warning("Stream error on %r: %s", ep.name, exc)
-                router.record_failure(ep, is_timeout=False)
+                if not is_direct:
+                    router.record_failure(ep, is_timeout=False)
                 attempts.append(AttemptLog(
                     endpoint_name=ep.name, latency_ms=latency_ms,
                     success=False, is_timeout=False, error_message=str(exc),

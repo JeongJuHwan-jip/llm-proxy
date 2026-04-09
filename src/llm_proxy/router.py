@@ -282,18 +282,26 @@ class Router:
         extra_headers: dict[str, str],
         steps: list[RouteStep],
         fallback_model: str,
+        is_direct: bool = False,
     ) -> tuple["httpx.Response", RouteStep, list[AttemptLog]]:
         """Try each RouteStep in order until one succeeds.
 
         ``body`` must already contain all fields except model — we set the
         model per step using ``step.model`` (or ``fallback_model`` when None).
 
+        When ``is_direct`` is True (direct endpoint/model request), circuit
+        breaker filtering and recording are skipped — the request goes
+        straight to the specified endpoint regardless of its circuit state.
+
         Returns (response, winning_step, attempts).
         Raises AllEndpointsFailedError if every step fails.
         """
         import httpx as _httpx
 
-        eligible = self.filter_steps(steps)
+        if is_direct:
+            eligible = steps
+        else:
+            eligible = self.filter_steps(steps)
         if not eligible:
             raise AllEndpointsFailedError([])
 
@@ -323,7 +331,8 @@ class Router:
                         "Upstream %r/%r returned %d — trying next step",
                         ep.name, model_for_step, response.status_code,
                     )
-                    self.record_failure(ep, is_timeout=False)
+                    if not is_direct:
+                        self.record_failure(ep, is_timeout=False)
                     attempts.append(AttemptLog(
                         endpoint_name=ep.name, latency_ms=latency_ms,
                         success=False, is_timeout=False,
@@ -331,7 +340,8 @@ class Router:
                     ))
                     continue
 
-                self.record_success(ep, latency_ms)
+                if not is_direct:
+                    self.record_success(ep, latency_ms)
                 attempts.append(AttemptLog(
                     endpoint_name=ep.name, latency_ms=latency_ms,
                     success=True, is_timeout=False,
@@ -341,7 +351,8 @@ class Router:
             except _httpx.TimeoutException as exc:
                 latency_ms = (time.monotonic() - t0) * 1000
                 logger.warning("Timeout on %r (%.0fms): %s", ep.name, latency_ms, exc)
-                self.record_failure(ep, is_timeout=True)
+                if not is_direct:
+                    self.record_failure(ep, is_timeout=True)
                 attempts.append(AttemptLog(
                     endpoint_name=ep.name, latency_ms=latency_ms,
                     success=False, is_timeout=True, error_message=str(exc),
@@ -350,7 +361,8 @@ class Router:
             except Exception as exc:  # noqa: BLE001
                 latency_ms = (time.monotonic() - t0) * 1000
                 logger.warning("Error on %r: %s", ep.name, exc)
-                self.record_failure(ep, is_timeout=False)
+                if not is_direct:
+                    self.record_failure(ep, is_timeout=False)
                 attempts.append(AttemptLog(
                     endpoint_name=ep.name, latency_ms=latency_ms,
                     success=False, is_timeout=False, error_message=str(exc),
