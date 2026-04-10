@@ -33,44 +33,12 @@ endpoints:
     url: "https://gamma.company.com/v1"
     timeout_ms: 10000
 
-# Failover — controls how the routing chain handles failures.
-# Only applies to named routes (routing.yaml chains), not direct endpoint/model requests.
-failover:
-  # Max number of retry attempts per request.
-  # e.g. 2 → try up to 3 steps total (1 initial + 2 retries) from the chain.
-  max_retries: 2
-
-  # How many consecutive failures (across different requests) before
-  # an endpoint is temporarily taken out of rotation ("circuit open").
-  # e.g. 3 → if alpha fails 3 requests in a row, skip it until cooldown expires.
-  circuit_breaker_threshold: 3
-
-  # Seconds to wait before retrying a circuit-opened endpoint.
-  # After cooldown, the endpoint enters "half-open" — one test request is sent.
-  # Success → back to normal ("closed"). Failure → open again for another cooldown.
-  circuit_breaker_cooldown: 60
-
-  # How to pick the next step when multiple are eligible.
-  #   "priority" — follow the chain order as written
-  #   "latency"  — prefer the endpoint with the lowest recent latency
-  routing_strategy: "priority"
-
-# Routing file (not tracked by git).
-# Copy routing.example.yaml → routing.yaml and edit it.
-# The proxy auto-discovers routing.yaml next to this file.
-# To reload routing at runtime without restarting:
-#   curl -X POST http://localhost:8000/api/routing/reload
+# Failover and routing are managed via the dashboard GUI.
+# When you click "Apply Settings" in the dashboard, a settings.json file
+# is auto-generated next to this config file.  No manual editing needed.
 #
-# routing_file: routing.yaml   # default: auto-discovered next to this file
-
-# Inline fallback (optional): used when routing.yaml is absent.
-# routing:
-#   - name: "best-available"
-#     chain:
-#       - endpoint: alpha
-#         model: gpt-4
-#       - endpoint: beta
-#         model: llama-3-70b
+# To reload settings at runtime without restarting:
+#   curl -X POST http://localhost:8000/api/routing/reload
 
 logging:
   db_path: "./data/proxy.db"

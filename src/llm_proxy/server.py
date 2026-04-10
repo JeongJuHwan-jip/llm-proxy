@@ -16,7 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from .config import ProxyConfig, load_routing_file, resolve_routing_file
+from .config import ProxyConfig, load_settings_file, resolve_settings_path
 from .database import Database
 from .discovery import (
     DiscoveryResult,
@@ -126,19 +126,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         app.state.db = db
         app.state.events = EventBroadcaster()
 
-        # ---- load routing file (overrides inline routing: in config) ----
-        routing_path = resolve_routing_file(
+        # ---- load settings.json (overrides inline routing + failover defaults) ----
+        settings_path = resolve_settings_path(
             config_path or Path(cfg.logging.db_path),
-            cfg.routing_file,
         )
-        app.state.routing_path = routing_path
-        if routing_path is not None and routing_path.exists():
+        app.state.settings_path = settings_path
+        if settings_path.exists():
             try:
-                routes = load_routing_file(routing_path)
-                router.reload_routing(routes)
-                logger.info("Loaded routing from %s", routing_path)
+                sdata = load_settings_file(settings_path)
+                router.reload_routing(sdata.routes)
+                if sdata.failover is not None:
+                    cfg.failover = sdata.failover
+                    logger.info("Loaded failover settings from %s", settings_path)
+                logger.info("Loaded settings from %s (%d routes)", settings_path, len(sdata.routes))
             except Exception as exc:
-                logger.warning("Could not load routing file %s: %s — using config routing", routing_path, exc)
+                logger.warning("Could not load %s: %s — using defaults", settings_path, exc)
         # ------------------------------------------------------------
 
         # ---- model discovery & change detection ----
@@ -259,25 +261,28 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/api/routing/reload")
     async def api_routing_reload(request: Request) -> JSONResponse:
-        """Re-read routing.yaml and apply it live — no restart needed."""
+        """Re-read settings.json and apply it live — no restart needed."""
         router: Router = request.app.state.router
-        routing_path: Path | None = request.app.state.routing_path
+        cfg: ProxyConfig = request.app.state.config
+        settings_path: Path = request.app.state.settings_path
 
-        if routing_path is None:
+        if not settings_path.exists():
             return JSONResponse(
-                {"error": "No routing file configured. Set routing_file in config or create routing.yaml next to it."},
+                {"error": f"Settings file not found: {settings_path}. Use the dashboard to create it."},
                 status_code=400,
             )
         try:
-            routes = load_routing_file(routing_path)
+            sdata = load_settings_file(settings_path)
         except Exception as exc:
-            return JSONResponse({"error": f"Failed to read {routing_path}: {exc}"}, status_code=422)
+            return JSONResponse({"error": f"Failed to read {settings_path}: {exc}"}, status_code=422)
 
-        router.reload_routing(routes)
+        router.reload_routing(sdata.routes)
+        if sdata.failover is not None:
+            cfg.failover = sdata.failover
         routed = router.get_routed_models()
         return JSONResponse({
             "status": "reloaded",
-            "routing_file": str(routing_path),
+            "settings_file": str(settings_path),
             "routes": list(routed.keys()),
         })
 
@@ -304,6 +309,158 @@ def _register_routes(app: FastAPI) -> None:
             "endpoint_models": discovery.endpoint_models,
             "endpoint_reachable": discovery.endpoint_reachable,
             "diff": diff_payload,
+        })
+
+    # --------------------------------------------------------- config helpers
+
+    def _save_settings(app_instance: FastAPI, route_configs=None) -> None:
+        """Save current failover + routing to settings.json."""
+        cfg_: ProxyConfig = app_instance.state.config
+        router_: Router = app_instance.state.router
+        spath: Path = app_instance.state.settings_path
+
+        if route_configs is None:
+            routed = router_.get_routed_models()
+            routes_out = [
+                {
+                    "name": rname,
+                    "chain": [{"endpoint": s["server"], "model": s["model"]} for s in chain],
+                }
+                for rname, chain in routed.items()
+            ]
+        else:
+            routes_out = [
+                {
+                    "name": rc.name,
+                    "chain": [{"endpoint": s.endpoint, "model": s.model} for s in rc.chain],
+                }
+                for rc in route_configs
+            ]
+
+        data = {
+            "failover": {
+                "max_retries": cfg_.failover.max_retries,
+                "circuit_breaker_threshold": cfg_.failover.circuit_breaker_threshold,
+                "circuit_breaker_cooldown": cfg_.failover.circuit_breaker_cooldown,
+                "routing_strategy": cfg_.failover.routing_strategy,
+            },
+            "routes": routes_out,
+        }
+
+        with open(spath, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        logger.info("Saved settings to %s", spath)
+
+    # --------------------------------------------------------- config APIs
+
+    @app.get("/api/config/settings")
+    async def api_get_settings(request: Request) -> JSONResponse:
+        """Return failover + routing settings.
+
+        Reads from settings.json if it exists; otherwise returns defaults
+        with empty routes so the dashboard starts clean.
+        """
+        cfg: ProxyConfig = request.app.state.config
+        spath: Path = request.app.state.settings_path
+
+        routes: list[dict] = []
+        if spath.exists():
+            try:
+                sdata = load_settings_file(spath)
+                routes = [
+                    {
+                        "name": r.name,
+                        "chain": [{"endpoint": s.endpoint, "model": s.model} for s in r.chain],
+                    }
+                    for r in sdata.routes
+                ]
+            except Exception:
+                pass  # corrupted file → show empty
+
+        return JSONResponse({
+            "failover": {
+                "max_retries": cfg.failover.max_retries,
+                "circuit_breaker_threshold": cfg.failover.circuit_breaker_threshold,
+                "circuit_breaker_cooldown": cfg.failover.circuit_breaker_cooldown,
+                "routing_strategy": cfg.failover.routing_strategy,
+            },
+            "routes": routes,
+        })
+
+    @app.put("/api/config/settings")
+    async def api_put_settings(request: Request) -> JSONResponse:
+        """Apply failover + routing together, persist to settings.json."""
+        cfg: ProxyConfig = request.app.state.config
+        router: Router = request.app.state.router
+        events: EventBroadcaster = request.app.state.events
+
+        try:
+            data = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON"}, status_code=400)
+
+        errors: list[str] = []
+
+        # ── Validate failover ──
+        fo = data.get("failover", {})
+        if "max_retries" in fo:
+            v = fo["max_retries"]
+            if not isinstance(v, int) or v < 0:
+                errors.append("max_retries must be a non-negative integer")
+        if "circuit_breaker_threshold" in fo:
+            v = fo["circuit_breaker_threshold"]
+            if not isinstance(v, int) or v < 1:
+                errors.append("circuit_breaker_threshold must be >= 1")
+        if "circuit_breaker_cooldown" in fo:
+            v = fo["circuit_breaker_cooldown"]
+            if not isinstance(v, int) or v < 0:
+                errors.append("circuit_breaker_cooldown must be >= 0")
+        if "routing_strategy" in fo:
+            v = fo["routing_strategy"]
+            if v not in ("priority", "latency"):
+                errors.append("routing_strategy must be 'priority' or 'latency'")
+
+        # ── Validate routes ──
+        routes_raw = data.get("routes", [])
+        if not isinstance(routes_raw, list):
+            errors.append("'routes' must be a list")
+
+        if errors:
+            return JSONResponse({"errors": errors}, status_code=422)
+
+        from .config import RouteConfig
+        try:
+            route_configs = [RouteConfig.model_validate(r) for r in routes_raw]
+        except Exception as exc:
+            return JSONResponse({"error": f"Validation error: {exc}"}, status_code=422)
+
+        # ── Apply failover in memory ──
+        if "max_retries" in fo:
+            cfg.failover.max_retries = fo["max_retries"]
+        if "circuit_breaker_threshold" in fo:
+            cfg.failover.circuit_breaker_threshold = fo["circuit_breaker_threshold"]
+        if "circuit_breaker_cooldown" in fo:
+            cfg.failover.circuit_breaker_cooldown = fo["circuit_breaker_cooldown"]
+        if "routing_strategy" in fo:
+            cfg.failover.routing_strategy = fo["routing_strategy"]
+
+        # ── Save to settings.json ──
+        _save_settings(request.app, route_configs=route_configs)
+
+        # ── Reload routing ──
+        router.reload_routing(route_configs)
+        routed = router.get_routed_models()
+
+        logger.info(
+            "Settings updated via dashboard — failover + %d route(s), saved to %s",
+            len(route_configs), request.app.state.settings_path,
+        )
+        events.publish()
+
+        return JSONResponse({
+            "status": "updated",
+            "settings_file": str(request.app.state.settings_path),
+            "routes": list(routed.keys()),
         })
 
     # ---------------------------------------------------------------- SSE

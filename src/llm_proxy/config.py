@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -112,12 +113,8 @@ class ProxyConfig(BaseModel):
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     auth: AuthConfig | None = None
-    # Inline routing — used when routing_file is absent or cannot be loaded.
+    # Inline routing — used when settings.json is absent.
     routing: list[RouteConfig] = Field(default_factory=list)
-    # Path to a separate routing file (relative to config dir or absolute).
-    # When set (or when routing.yaml exists next to config), that file takes
-    # precedence over the inline routing: section above.
-    routing_file: str | None = None
 
     @model_validator(mode="after")
     def check_endpoints_not_empty(self) -> "ProxyConfig":
@@ -182,54 +179,50 @@ def resolve_api_keys(keys: list[str]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Routing file helpers
+# Settings file helpers (settings.json — managed by dashboard)
 # ---------------------------------------------------------------------------
 
 
-def load_routing_file(path: str | Path) -> list[RouteConfig]:
-    """Load a standalone routing YAML file (a list of route configs).
+class SettingsFileData:
+    """Parsed content of settings.json (failover + routes)."""
 
-    The file contains the same structure as the ``routing:`` section of config.yaml:
+    def __init__(
+        self,
+        routes: list[RouteConfig],
+        failover: FailoverConfig | None = None,
+    ) -> None:
+        self.routes = routes
+        self.failover = failover
 
-    .. code-block:: yaml
 
-        - name: "best-available"
-          chain:
-            - endpoint: alpha
-              model: gpt-4
-            - endpoint: beta
-              model: llama-3
+def load_settings_file(path: str | Path) -> SettingsFileData:
+    """Load settings.json containing failover config and routes.
 
-    Returns an empty list if the file does not exist.
-    Raises ValueError on parse errors so the caller can decide to fall back.
+    Returns ``SettingsFileData`` with routes and optionally failover.
+    Returns empty data if the file does not exist.
     """
     path = Path(path)
     if not path.exists():
-        return []
+        return SettingsFileData(routes=[])
     with path.open("r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
-    if raw is None:
-        return []
-    if not isinstance(raw, list):
-        raise ValueError(f"Routing file must be a YAML list, got {type(raw).__name__}: {path}")
-    return [RouteConfig.model_validate(item) for item in raw]
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"settings.json must be a JSON object, got {type(raw).__name__}: {path}")
+
+    failover = None
+    if "failover" in raw and raw["failover"]:
+        failover = FailoverConfig.model_validate(raw["failover"])
+
+    routes_raw = raw.get("routes", [])
+    if not isinstance(routes_raw, list):
+        raise ValueError(f"'routes' must be a list in {path}")
+    routes = [RouteConfig.model_validate(item) for item in routes_raw]
+    return SettingsFileData(routes=routes, failover=failover)
 
 
-def resolve_routing_file(config_path: Path, routing_file: str | None) -> Path | None:
-    """Return the resolved path to the routing file, or None if not applicable.
-
-    Resolution order:
-    1. Explicit ``routing_file`` value in config (relative → resolved against config dir).
-    2. ``routing.yaml`` next to the config file (auto-discovery).
-    """
-    if routing_file:
-        p = Path(routing_file)
-        if not p.is_absolute():
-            p = config_path.parent / p
-        return p
-    # Auto-discover routing.yaml next to config
-    candidate = config_path.parent / "routing.yaml"
-    return candidate if candidate.exists() else None
+def resolve_settings_path(config_path: Path) -> Path:
+    """Return the path to settings.json next to the config file."""
+    return config_path.parent / "settings.json"
 
 
 # ---------------------------------------------------------------------------

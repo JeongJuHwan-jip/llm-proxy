@@ -4,16 +4,18 @@ A lightweight local proxy server that routes requests across multiple OpenAI-com
 
 ## Features
 
-- **Failover** — multiple endpoints per model; on timeout/error the next endpoint is tried automatically
-- **Circuit breaker** — after N consecutive failures an endpoint is excluded for a cooldown period, then auto-recovered
-- **Streaming** — full SSE / `stream: true` support
+- **Named route chains** — define fallback chains like `alpha/gpt-4 -> beta/llama-3 -> gamma/mistral-7b`; on timeout/error the next step is tried automatically
+- **Direct addressing** — send to a specific endpoint with `endpoint_name/model_id` (bypasses routing & circuit breaker)
+- **Circuit breaker** — after N consecutive failures an endpoint is excluded for a cooldown period, then auto-recovered via half-open probe
+- **Streaming** — full SSE / `stream: true` support with per-chunk forwarding
+- **Dashboard GUI** — real-time endpoint health monitoring, request log, and a drag-and-drop routing editor to configure failover + routes visually
+- **Model discovery** — auto-detects available models from all endpoints at startup
 - **Custom headers** — per-endpoint static headers with `{{uuid}}` and `{{env:VAR}}` templates
-- **Dashboard** — built-in web UI showing endpoint health, latency stats, and request history
 - **SQLite logging** — WAL-mode, zero external dependencies
 - **Auth** — optional API key protection
 - **pip-installable** — single `pip install` + `llm-proxy start`
 
-## Getting Started (Development)
+## Getting Started
 
 ```bash
 git clone https://github.com/JeongJuHwan-jip/llm-proxy.git
@@ -32,10 +34,13 @@ uv pip install -e ".[test]"
 
 # Copy and edit the example config
 cp config.example.yaml config.yaml
-# Edit config.yaml — set your endpoint URLs
+# Edit config.yaml — set your endpoint URLs and headers
 
 # Validate config
 llm-proxy validate --config config.yaml
+
+# Discover models from all endpoints
+llm-proxy discover --config config.yaml
 
 # Start the server
 llm-proxy start --config config.yaml
@@ -44,38 +49,41 @@ llm-proxy start --config config.yaml
 The proxy listens on `http://0.0.0.0:8000` by default.  
 Dashboard: `http://localhost:8000/dashboard/index.html`
 
+## Dashboard
+
+The dashboard has two tabs:
+
+- **Monitor** — live endpoint health cards (circuit state, latency, failure rates) and a request history table, updated via SSE
+- **Settings** — configure failover parameters and build routing chains with drag-and-drop
+
+When you click **Apply Settings**, a `settings.json` file is created next to your config.yaml. No manual file editing needed — the dashboard manages it entirely.
+
 ## Config Reference
 
+`config.yaml` defines your endpoints and infrastructure. Routing and failover are managed via the dashboard.
+
 ```yaml
-server:
+proxy:
   host: "0.0.0.0"
   port: 8000
+  header_priority: "config"   # "config" or "client" — who wins on header conflicts
 
 endpoints:
-  - name: "llm-api-alpha"
-    url: "https://internal-alpha.company.com/v1"
-    timeout_ms: 5000          # per-request timeout in milliseconds
-    priority: 1               # lower = tried first
+  - name: "alpha"
+    url: "https://alpha.company.com/v1"
+    timeout_ms: 5000
     headers:
-      X-Request-ID: "{{uuid}}"          # new UUID per request
-      Authorization: "Bearer {{env:ALPHA_TOKEN}}"  # from env var
+      X-Request-ID: "{{uuid}}"
+      Authorization: "Bearer {{env:ALPHA_TOKEN}}"
 
-  - name: "llm-api-beta"
-    url: "https://internal-beta.company.com/v1"
+  - name: "beta"
+    url: "https://beta.company.com/v1"
     timeout_ms: 8000
-    priority: 2
-
-failover:
-  max_retries: 2                  # total attempts = max_retries + 1
-  circuit_breaker_threshold: 3    # consecutive failures before OPEN
-  circuit_breaker_cooldown: 60    # seconds before HALF_OPEN probe
-  routing_strategy: "priority"    # "priority" (default) or "latency"
 
 logging:
   db_path: "./data/proxy.db"
-  log_request_body: false         # set true only for debugging (security risk)
+  log_request_body: false
 
-# Optional proxy-level auth
 # auth:
 #   api_keys:
 #     - "{{env:PROXY_API_KEY}}"
@@ -88,13 +96,82 @@ logging:
 | `{{uuid}}` | A fresh `uuid4()` string on every request |
 | `{{env:VAR_NAME}}` | The value of the `VAR_NAME` environment variable |
 
+### Request routing
+
+Clients set the `model` field in their request body:
+
+| model value | Behavior |
+|---|---|
+| `alpha/gpt-4` | **Direct** — sends to endpoint `alpha` with model `gpt-4`. No circuit breaker or failover. |
+| `best-available` | **Named route** — follows the failback chain defined in the dashboard (e.g. alpha/gpt-4 -> beta/llama-3 -> gamma/mistral). |
+
 ## CLI
 
 ```
 llm-proxy --help
-llm-proxy start --config config.yaml [--host HOST] [--port PORT] [--workers N]
+llm-proxy start    --config config.yaml [--host HOST] [--port PORT] [--workers N]
 llm-proxy validate --config config.yaml
+llm-proxy discover --config config.yaml [--snippet]
 ```
+
+## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| POST | `/v1/chat/completions` | Proxy with failover |
+| GET | `/v1/models` | Merged model list (direct + named routes) |
+| GET | `/api/status` | Endpoint health snapshots |
+| GET | `/api/requests?limit=50` | Recent request log |
+| GET | `/api/discovery` | Discovery results + diff |
+| GET | `/api/config/settings` | Current failover + routing |
+| PUT | `/api/config/settings` | Apply failover + routing (saves to settings.json) |
+| POST | `/api/routing/reload` | Re-read settings.json without restart |
+| GET | `/api/events` | SSE stream for dashboard |
+
+## Local Testing with Mock Servers
+
+```bash
+# Start mock LLM servers
+python scripts/mock_llm_server.py --port 8001 --name alpha --models gpt-4,claude-3
+python scripts/mock_llm_server.py --port 8002 --name beta --models gpt-4,llama-3 --behavior flaky --fail-rate 0.5
+python scripts/mock_llm_server.py --port 8003 --name gamma --models mistral-7b
+
+# Mock server options:
+#   --behavior ok|timeout|error|flaky|slow
+#   --fail-rate 0.5          (for flaky)
+#   --timeout-rate 0.3       (fraction of flaky failures that are timeouts)
+#   --delay 5.0              (seconds for slow/timeout)
+#   --latency-min 0.1 --latency-max 0.8   (random latency on success)
+
+# Start proxy
+llm-proxy start --config config.local-test.yaml
+```
+
+## Architecture
+
+```
+client -> FastAPI (/v1/chat/completions)
+             |
+             v
+          Router.execute(steps=[...])
+             |   +------------------------------------+
+             +-->| EndpointState (alpha)  [CLOSED]     | --> upstream
+             |   |   circuit breaker, latency samples  |
+             |   +------------------------------------+
+             |   +------------------------------------+
+             +-->| EndpointState (beta)   [CLOSED]     | --> upstream (failover)
+             |   +------------------------------------+
+             |   +------------------------------------+
+             +-->| EndpointState (gamma)  [CLOSED]     | --> upstream (failover)
+                 +------------------------------------+
+                             |
+                             v
+                     Database (SQLite WAL)
+```
+
+**Files:**
+- `config.yaml` — endpoint definitions, auth, proxy settings (human-edited)
+- `settings.json` — failover config + route chains (managed by dashboard, auto-generated)
 
 ## Development
 
@@ -102,31 +179,9 @@ llm-proxy validate --config config.yaml
 # Run tests
 pytest
 
-# Run server (changes to src/ take effect immediately)
-llm-proxy start --config config.example.yaml
+# Run with local mock servers
+llm-proxy start --config config.local-test.yaml --port 9000
 ```
-
-## Architecture
-
-```
-client → FastAPI (/v1/chat/completions)
-           │
-           ▼
-        Router.execute()
-           │   ┌──────────────────────────────────────┐
-           ├──▶│ EndpointState (alpha)  [CLOSED]       │ ──▶ upstream
-           │   │   circuit_breaker, latency_samples    │
-           │   └──────────────────────────────────────┘
-           │   ┌──────────────────────────────────────┐
-           └──▶│ EndpointState (beta)   [CLOSED]       │ ──▶ upstream (failover)
-               └──────────────────────────────────────┘
-                           │
-                           ▼
-                       Database (SQLite WAL)
-```
-
-**Internal routing table**: `dict[model_name, list[EndpointState]]`  
-The `"*"` wildcard key matches all models. Future releases will add per-model keys for fine-grained routing.
 
 ## Docker
 

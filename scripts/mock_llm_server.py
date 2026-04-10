@@ -14,8 +14,18 @@ Usage:
     # Server that fails 70% of the time
     python scripts/mock_llm_server.py --port 8003 --behavior flaky --fail-rate 0.7
 
+    # Flaky server where 40% of failures are timeouts (not just HTTP errors)
+    python scripts/mock_llm_server.py --port 8003 --behavior flaky --fail-rate 0.5 --timeout-rate 0.4
+
     # Server with 3s artificial delay
     python scripts/mock_llm_server.py --port 8004 --behavior slow --delay 3.0
+
+    # Random latency on all responses (100ms–800ms)
+    python scripts/mock_llm_server.py --port 8001 --latency-min 0.1 --latency-max 0.8
+
+    # Combine: flaky server with random latency on successful responses
+    python scripts/mock_llm_server.py --port 8003 --behavior flaky --fail-rate 0.3 \
+        --timeout-rate 0.3 --latency-min 0.05 --latency-max 1.5
 
     # Server with a custom model list (simulates different endpoints having
     # different models — pass comma-separated model IDs)
@@ -27,8 +37,14 @@ Behaviors:
     ok       — always returns a valid response (default)
     timeout  — hangs forever (triggers proxy timeout)
     error    — always returns HTTP 500
-    flaky    — randomly fails at --fail-rate probability
+    flaky    — randomly fails at --fail-rate probability;
+               --timeout-rate controls what fraction of failures are
+               timeouts (slow response) vs HTTP 503 errors
     slow     — adds --delay seconds before responding
+
+Latency:
+    --latency-min / --latency-max add random delay to ALL successful
+    responses (applied on top of behavior-specific delays).
 """
 
 import argparse
@@ -53,6 +69,12 @@ parser.add_argument("--fail-rate", type=float, default=0.5,
                     help="Failure probability for --behavior flaky (0.0–1.0)")
 parser.add_argument("--delay", type=float, default=2.0,
                     help="Delay in seconds for --behavior slow")
+parser.add_argument("--timeout-rate", type=float, default=0.0,
+                    help="Fraction of flaky failures that are timeouts vs HTTP 503 (0.0–1.0)")
+parser.add_argument("--latency-min", type=float, default=0.0,
+                    help="Minimum random latency added to successful responses (seconds)")
+parser.add_argument("--latency-max", type=float, default=0.0,
+                    help="Maximum random latency added to successful responses (seconds)")
 parser.add_argument("--name", type=str, default=None,
                     help="Server name shown in responses (defaults to port)")
 parser.add_argument("--models", type=str, default=None,
@@ -157,15 +179,30 @@ async def chat_completions(request: Request):
 
     elif args.behavior == "flaky":
         if random.random() < args.fail_rate:
-            print(f"[{SERVER_NAME}] Flaky: returning 503")
-            return JSONResponse(
-                status_code=503,
-                content={"error": {"message": "Service temporarily unavailable"}},
-            )
+            if args.timeout_rate > 0 and random.random() < args.timeout_rate:
+                print(f"[{SERVER_NAME}] Flaky: timeout (sleeping {args.delay}s)...")
+                await asyncio.sleep(args.delay)
+                # Still return after the long delay — proxy should have timed out by now
+                return JSONResponse(
+                    status_code=504,
+                    content={"error": {"message": "Gateway timeout (mock)"}},
+                )
+            else:
+                print(f"[{SERVER_NAME}] Flaky: returning 503")
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {"message": "Service temporarily unavailable"}},
+                )
 
     elif args.behavior == "slow":
         print(f"[{SERVER_NAME}] Sleeping {args.delay}s...")
         await asyncio.sleep(args.delay)
+
+    # ── Random latency on successful responses ──────────────────────────────
+    if args.latency_max > 0:
+        lat = random.uniform(args.latency_min, args.latency_max)
+        print(f"[{SERVER_NAME}] Random latency: {lat:.3f}s")
+        await asyncio.sleep(lat)
 
     # ── Normal response ─────────────────────────────────────────────────────
     content = f"Hello from {SERVER_NAME}! (request #{count})"
@@ -197,6 +234,12 @@ async def health():
 
 
 if __name__ == "__main__":
-    print(f"Starting {SERVER_NAME} on port {args.port} "
-          f"[behavior={args.behavior}] models={MODEL_IDS}")
+    parts = [f"Starting {SERVER_NAME} on port {args.port}",
+             f"behavior={args.behavior}"]
+    if args.behavior == "flaky":
+        parts.append(f"fail_rate={args.fail_rate} timeout_rate={args.timeout_rate}")
+    if args.latency_max > 0:
+        parts.append(f"latency={args.latency_min:.2f}–{args.latency_max:.2f}s")
+    parts.append(f"models={MODEL_IDS}")
+    print(" | ".join(parts))
     uvicorn.run(app, host="127.0.0.1", port=args.port, log_level="warning")

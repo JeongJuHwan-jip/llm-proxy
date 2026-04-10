@@ -159,17 +159,31 @@ def validate(config: str) -> None:
         sys.exit(1)
 
     click.echo(f"Config OK — {len(cfg.endpoints)} endpoint(s):")
-    for ep in sorted(cfg.endpoints, key=lambda e: e.priority):
+    for ep in cfg.endpoints:
         click.echo(
-            f"  [{ep.priority}] {ep.name}  {ep.url}  "
+            f"  {ep.name}  {ep.url}  "
             f"timeout={ep.timeout_ms}ms  headers={list(ep.headers.keys())}"
         )
-    click.echo(
-        f"\nFailover: max_retries={cfg.failover.max_retries}  "
-        f"cb_threshold={cfg.failover.circuit_breaker_threshold}  "
-        f"cb_cooldown={cfg.failover.circuit_breaker_cooldown}s  "
-        f"strategy={cfg.failover.routing_strategy}"
-    )
+
+    # Check for settings.json
+    from .config import load_settings_file, resolve_settings_path
+    settings_path = resolve_settings_path(Path(config).resolve())
+    if settings_path.exists():
+        try:
+            sdata = load_settings_file(settings_path)
+            fo = sdata.failover or cfg.failover
+            click.echo(
+                f"\nSettings ({settings_path.name}): {len(sdata.routes)} route(s)  "
+                f"max_retries={fo.max_retries}  "
+                f"cb_threshold={fo.circuit_breaker_threshold}  "
+                f"cb_cooldown={fo.circuit_breaker_cooldown}s  "
+                f"strategy={fo.routing_strategy}"
+            )
+        except Exception as exc:
+            click.echo(f"\nSettings: error reading {settings_path}: {exc}", err=True)
+    else:
+        click.echo(f"\nSettings: {settings_path.name} not found (will use defaults)")
+
     click.echo(
         f"Logging: db={cfg.logging.db_path}  "
         f"log_body={cfg.logging.log_request_body}"

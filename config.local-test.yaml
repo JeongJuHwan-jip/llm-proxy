@@ -29,31 +29,8 @@ endpoints:
     url: "http://127.0.0.1:8003/v1"
     timeout_ms: 5000
 
-failover:
-  max_retries: 3
-  circuit_breaker_threshold: 3
-  circuit_breaker_cooldown: 30
-  routing_strategy: "priority"
-
-# Named fallback chains — edit routing.yaml instead for hot-reload.
-routing:
-  - name: "best-available"
-    chain:
-      - endpoint: alpha
-        model: gpt-4
-      - endpoint: beta
-        model: llama-3
-      - endpoint: gamma
-        model: mistral-7b
-
-  - name: "gpt4-chain"
-    chain:
-      - endpoint: alpha
-        model: gpt-4
-      - endpoint: beta
-        model: gpt-4
-      - endpoint: alpha         # same endpoint, different model fallback
-        model: claude-3
+# Failover and routing are configured via dashboard → saved to settings.json.
+# Start the proxy, open http://localhost:9000/dashboard, go to Settings tab.
 
 logging:
   db_path: "./data/local-test.db"

@@ -25,9 +25,9 @@ data/
 .env
 *.env
 
-# Personal config & routing — not tracked; use *.example.yaml as templates
+# Personal config & runtime state — not tracked
 config.yaml
-routing.yaml
+settings.json
 model_snapshot.json
 
 # IDE

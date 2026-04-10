@@ -7,45 +7,112 @@
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-  <header>
-    <h1>LLM Proxy Dashboard</h1>
-    <div id="refresh-info">
-      Connecting...
-      <button id="btn-refresh">Refresh now</button>
+  <!-- Sidebar -->
+  <nav id="sidebar">
+    <div class="sidebar-title">LLM Proxy</div>
+    <button class="tab-btn active" data-tab="tab-monitor">Monitor</button>
+    <button class="tab-btn" data-tab="tab-settings">Settings</button>
+    <div class="sidebar-footer">
+      <span id="connection-status">Connecting...</span>
+      <button id="btn-refresh" title="Refresh now">&#x21bb;</button>
     </div>
-  </header>
+  </nav>
 
-  <main>
-    <!-- Endpoint status cards -->
-    <section>
-      <h2>Endpoint Status</h2>
-      <div id="endpoints-container" class="cards">
-        <p class="loading">Loading…</p>
-      </div>
-    </section>
+  <!-- Main content -->
+  <main id="content">
 
-    <!-- Recent requests table -->
-    <section>
-      <h2>Recent Requests <span id="total-count" class="badge"></span></h2>
-      <div class="table-wrapper">
-        <table id="requests-table">
-          <thead>
-            <tr>
-              <th>Time</th>
-              <th>Model</th>
-              <th>Endpoint</th>
-              <th>Status</th>
-              <th>Latency</th>
-              <th>Stream</th>
-              <th>Attempts</th>
-            </tr>
-          </thead>
-          <tbody id="requests-body">
-            <tr><td colspan="7" class="loading">Loading…</td></tr>
-          </tbody>
-        </table>
+    <!-- ======== Monitor tab ======== -->
+    <div id="tab-monitor" class="tab-panel active">
+      <section>
+        <h2>Endpoint Status</h2>
+        <div id="endpoints-container" class="cards">
+          <p class="muted">Loading...</p>
+        </div>
+      </section>
+
+      <section>
+        <h2>Recent Requests <span id="total-count" class="badge"></span></h2>
+        <div class="table-wrapper">
+          <table id="requests-table">
+            <thead>
+              <tr>
+                <th>Time</th><th>Model</th><th>Endpoint</th>
+                <th>Status</th><th>Latency</th><th>Stream</th><th>Attempts</th>
+              </tr>
+            </thead>
+            <tbody id="requests-body">
+              <tr><td colspan="7" class="muted">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </div>
+
+    <!-- ======== Settings tab ======== -->
+    <div id="tab-settings" class="tab-panel">
+
+      <!-- Unified toolbar -->
+      <div class="settings-toolbar">
+        <button id="btn-add-route" class="btn btn-secondary" type="button">+ New Route</button>
+        <button id="btn-apply-settings" class="btn btn-primary" type="button">Apply Settings</button>
+        <span id="settings-status" class="save-status"></span>
       </div>
-    </section>
+
+      <!-- Failover settings -->
+      <section class="settings-section">
+        <h2>Failover</h2>
+        <div class="settings-card">
+          <div class="settings-grid">
+            <label for="fo-max-retries">Max Retries</label>
+            <div>
+              <input type="number" id="fo-max-retries" min="0" step="1" />
+              <span class="hint">Per-request retry count (0 = no retries)</span>
+            </div>
+
+            <label for="fo-cb-threshold">CB Threshold</label>
+            <div>
+              <input type="number" id="fo-cb-threshold" min="1" step="1" />
+              <span class="hint">Consecutive failures before circuit opens</span>
+            </div>
+
+            <label for="fo-cb-cooldown">CB Cooldown (s)</label>
+            <div>
+              <input type="number" id="fo-cb-cooldown" min="0" step="1" />
+              <span class="hint">Seconds before half-open probe</span>
+            </div>
+
+            <label for="fo-strategy">Strategy</label>
+            <div>
+              <select id="fo-strategy">
+                <option value="priority">priority</option>
+                <option value="latency">latency</option>
+              </select>
+              <span class="hint">How to pick the next step in a chain</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Routing editor -->
+      <section class="settings-section">
+        <h2>Routing</h2>
+
+        <div class="routing-layout">
+          <!-- Available model blocks (palette) -->
+          <div class="palette-panel">
+            <h3>Available Models</h3>
+            <p class="hint" id="palette-hint">Drag blocks into a route chain</p>
+            <div id="model-palette" class="palette-list"></div>
+          </div>
+
+          <!-- Routes (drop targets) -->
+          <div class="routes-panel">
+            <div id="routes-container"></div>
+          </div>
+        </div>
+      </section>
+
+    </div>
   </main>
 
   <script src="app.js"></script>
