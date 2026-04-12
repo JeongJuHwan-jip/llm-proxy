@@ -412,6 +412,19 @@ function initSettingsControls() {
 
   document.getElementById('btn-apply-settings').addEventListener('click', async () => {
     const st = document.getElementById('settings-status');
+
+    // Validate: every route card must have a name
+    const cards = document.querySelectorAll('.route-card');
+    for (const card of cards) {
+      const input = card.querySelector('.route-name-input');
+      if (!input.value.trim()) {
+        input.focus();
+        st.textContent = 'Route name is required'; st.className = 'save-status save-err';
+        setTimeout(() => { st.textContent = ''; }, 4000);
+        return;
+      }
+    }
+
     st.textContent = 'Saving...'; st.className = 'save-status';
 
     const payload = {

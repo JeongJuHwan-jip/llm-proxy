@@ -27,9 +27,10 @@ def _should_failover(status_code: int) -> bool:
 
     5xx = server errors (worth retrying on another endpoint).
     429 = rate limited (try another endpoint).
-    4xx other than 429 = client errors (same request will fail everywhere; don't retry).
+    408 = request timeout (upstream timed out; try another endpoint).
+    Other 4xx = client errors (same request will fail everywhere; don't retry).
     """
-    return status_code >= 500 or status_code == 429
+    return status_code >= 500 or status_code == 429 or status_code == 408
 
 
 class AllEndpointsFailedError(Exception):
@@ -321,8 +322,9 @@ class Router:
 
                 if _should_failover(response.status_code):
                     logger.warning(
-                        "Upstream %r/%r returned %d — trying next step",
+                        "Upstream %r/%r returned %d — %s",
                         ep.name, model_for_step, response.status_code,
+                        "returning error (direct request)" if is_direct else "trying next step",
                     )
                     if not is_direct:
                         self.record_failure(ep, is_timeout=False)
@@ -331,6 +333,8 @@ class Router:
                         success=False, is_timeout=False,
                         error_message=f"HTTP {response.status_code}",
                     ))
+                    if is_direct:
+                        return response, step, attempts
                     continue
 
                 if not is_direct:

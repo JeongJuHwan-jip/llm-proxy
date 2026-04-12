@@ -700,18 +700,21 @@ async def _handle_stream(
                 latency_ms = (time.monotonic() - t0) * 1000
 
                 if _should_failover(resp.status_code):
-                    await resp.aclose()
                     logger.warning(
-                        "Stream upstream %r/%r returned %d — trying next step",
+                        "Stream upstream %r/%r returned %d — %s",
                         ep.name, model_for_step, resp.status_code,
+                        "returning error (direct)" if is_direct else "trying next step",
                     )
                     if not is_direct:
+                        await resp.aclose()
                         router.record_failure(ep, is_timeout=False)
                     attempts.append(AttemptLog(
                         endpoint_name=ep.name, latency_ms=latency_ms,
                         success=False, is_timeout=False,
                         error_message=f"HTTP {resp.status_code}",
                     ))
+                    if is_direct:
+                        return resp, step, attempts
                     continue
 
                 if not is_direct:
