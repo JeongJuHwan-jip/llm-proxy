@@ -1,13 +1,14 @@
 # LLM Proxy
 
-A lightweight local proxy server that routes requests across multiple OpenAI-compatible LLM API endpoints with automatic failover, circuit breaking, and a built-in dashboard.
+A lightweight local proxy server that routes requests across multiple OpenAI-compatible LLM API endpoints with automatic failover, circuit breaking, and a built-in dashboard. Supports both OpenAI and Anthropic client formats — clients can use either `POST /v1/chat/completions` (OpenAI) or `POST /v1/messages` (Anthropic) to reach the same upstream endpoints.
 
 ## Features
 
 - **Named route chains** — define fallback chains like `alpha/gpt-4 -> beta/llama-3 -> gamma/mistral-7b`; on timeout/error the next step is tried automatically
 - **Direct addressing** — send to a specific endpoint with `endpoint_name/model_id` (bypasses routing & circuit breaker)
 - **Circuit breaker** — after N consecutive failures an endpoint is excluded for a cooldown period, then auto-recovered via half-open probe
-- **Streaming** — full SSE / `stream: true` support with per-chunk forwarding
+- **Anthropic Messages API** — `POST /v1/messages` endpoint translates Anthropic format to OpenAI on the fly; supports text, tool use, images, streaming, and error format conversion
+- **Streaming** — full SSE / `stream: true` support with per-chunk forwarding (both OpenAI and Anthropic SSE formats)
 - **Dashboard GUI** — real-time endpoint health monitoring, request log, and a drag-and-drop routing editor to configure failover + routes visually
 - **Model discovery** — auto-detects available models from all endpoints at startup
 - **Custom headers** — per-endpoint static headers with `{{uuid}}` and `{{env:VAR}}` templates
@@ -118,7 +119,8 @@ llm-proxy discover --config config.yaml [--snippet]
 
 | Method | Path | Description |
 |---|---|---|
-| POST | `/v1/chat/completions` | Proxy with failover |
+| POST | `/v1/chat/completions` | Proxy with failover (OpenAI format) |
+| POST | `/v1/messages` | Proxy with failover (Anthropic format) |
 | GET | `/v1/models` | Merged model list (direct + named routes) |
 | GET | `/api/status` | Endpoint health snapshots |
 | GET | `/api/requests?limit=50` | Recent request log |
@@ -150,23 +152,33 @@ llm-proxy start --config config.local-test.yaml
 ## Architecture
 
 ```
-client -> FastAPI (/v1/chat/completions)
-             |
-             v
-          Router.execute(steps=[...])
-             |   +------------------------------------+
-             +-->| EndpointState (alpha)  [CLOSED]     | --> upstream
-             |   |   circuit breaker, latency samples  |
-             |   +------------------------------------+
-             |   +------------------------------------+
-             +-->| EndpointState (beta)   [CLOSED]     | --> upstream (failover)
-             |   +------------------------------------+
-             |   +------------------------------------+
-             +-->| EndpointState (gamma)  [CLOSED]     | --> upstream (failover)
-                 +------------------------------------+
-                             |
-                             v
-                     Database (SQLite WAL)
+client (OpenAI format)     -> POST /v1/chat/completions  ----+
+client (Anthropic format)  -> POST /v1/messages               |
+                                |                              |
+                                v                              |
+                         Anthropic Adapter                     |
+                    (translate_request: Anthropic→OpenAI)      |
+                                |                              |
+                                +------------------------------+
+                                |
+                                v
+                         Router.execute(steps=[...])
+                                |   +------------------------------------+
+                                +-->| EndpointState (alpha)  [CLOSED]     | --> upstream (OpenAI-compatible)
+                                |   |   circuit breaker, latency samples  |
+                                |   +------------------------------------+
+                                |   +------------------------------------+
+                                +-->| EndpointState (beta)   [CLOSED]     | --> upstream (failover)
+                                |   +------------------------------------+
+                                |   +------------------------------------+
+                                +-->| EndpointState (gamma)  [CLOSED]     | --> upstream (failover)
+                                    +------------------------------------+
+                                                |
+                                                v
+                                   translate_response (if Anthropic)
+                                                |
+                                                v
+                                        Database (SQLite WAL)
 ```
 
 **Files:**

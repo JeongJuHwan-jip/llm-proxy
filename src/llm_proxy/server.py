@@ -222,6 +222,15 @@ def _register_routes(app: FastAPI) -> None:
     async def list_models(request: Request) -> JSONResponse:
         return await _handle_list_models(request)
 
+    # POST /v1/messages — Anthropic Messages API adapter
+    @app.post(
+        "/v1/messages",
+        dependencies=[Depends(_require_api_key)],
+    )
+    async def anthropic_messages(request: Request) -> Response:
+        from .adapters.anthropic import handle_anthropic_messages
+        return await handle_anthropic_messages(request)
+
     # Catch-all for other /v1/* paths — forward with correct HTTP method
     @app.api_route(
         "/v1/{path:path}",
