@@ -16,18 +16,15 @@ proxy:
 endpoints:
   - name: "alpha"
     url: "http://127.0.0.1:8001/v1"
-    timeout_ms: 2000          # alpha hangs → times out in 2s → failover
     headers:
       X-Request-ID: "{{uuid}}"
       x-title: "Roo Codes"
 
   - name: "beta"
     url: "http://127.0.0.1:8002/v1"
-    timeout_ms: 3000
 
   - name: "gamma"
     url: "http://127.0.0.1:8003/v1"
-    timeout_ms: 5000
 
 # Failover and routing are configured via dashboard → saved to settings.json.
 # Start the proxy, open http://localhost:9000/dashboard, go to Settings tab.

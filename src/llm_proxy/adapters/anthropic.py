@@ -673,7 +673,7 @@ async def _handle_anthropic_stream(
             _resolve(ep.headers), forward_headers, cfg.proxy.header_priority,
         )
         url = f"{ep.url}/chat/completions"
-        timeout = ep.timeout_ms / 1000.0
+        timeout = step.timeout_ms / 1000.0
         t0 = time.monotonic()
 
         try:

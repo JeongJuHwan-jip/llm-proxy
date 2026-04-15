@@ -162,7 +162,7 @@ def validate(config: str) -> None:
     for ep in cfg.endpoints:
         click.echo(
             f"  {ep.name}  {ep.url}  "
-            f"timeout={ep.timeout_ms}ms  headers={list(ep.headers.keys())}"
+            f"headers={list(ep.headers.keys())}"
         )
 
     # Check for settings.json

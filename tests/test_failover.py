@@ -43,9 +43,9 @@ def three_ep_config() -> ProxyConfig:
     return ProxyConfig(
         proxy=ProxyServerConfig(host="127.0.0.1", port=8000),
         endpoints=[
-            EndpointConfig(name="alpha", url="https://alpha.example.com/v1", timeout_ms=2000),
-            EndpointConfig(name="beta", url="https://beta.example.com/v1", timeout_ms=3000),
-            EndpointConfig(name="gamma", url="https://gamma.example.com/v1", timeout_ms=5000),
+            EndpointConfig(name="alpha", url="https://alpha.example.com/v1"),
+            EndpointConfig(name="beta", url="https://beta.example.com/v1"),
+            EndpointConfig(name="gamma", url="https://gamma.example.com/v1"),
         ],
         failover=FailoverConfig(
             max_retries=3,

@@ -98,7 +98,6 @@ def test_load_full_config():
             {
                 "name": "ep1",
                 "url": "https://ep1.example.com/v1",
-                "timeout_ms": 3000,
                 "headers": {"X-Key": "val"},
             }
         ],

@@ -26,7 +26,6 @@ def config_no_auth() -> ProxyConfig:
             EndpointConfig(
                 name="mock-ep",
                 url="https://mock.example.com/v1",
-                timeout_ms=5000,
             )
         ],
         failover=FailoverConfig(max_retries=0, circuit_breaker_threshold=3),

@@ -68,7 +68,6 @@ class Router:
             self._ep_by_name[ep.name] = EndpointState(
                 name=ep.name,
                 url=ep.url,
-                timeout_ms=ep.timeout_ms,
                 headers=ep.headers,
             )
 
@@ -80,7 +79,7 @@ class Router:
             for step_cfg in route.chain:
                 ep = self._ep_by_name.get(step_cfg.endpoint)
                 if ep is not None:
-                    steps.append(RouteStep(ep, step_cfg.model))
+                    steps.append(RouteStep(ep, step_cfg.model, step_cfg.timeout_ms))
                 else:
                     unknown.append(step_cfg.endpoint)
 
@@ -116,7 +115,7 @@ class Router:
             for step_cfg in route.chain:
                 ep = self._ep_by_name.get(step_cfg.endpoint)
                 if ep is not None:
-                    steps.append(RouteStep(ep, step_cfg.model))
+                    steps.append(RouteStep(ep, step_cfg.model, step_cfg.timeout_ms))
                 else:
                     unknown.append(step_cfg.endpoint)
             if unknown:
@@ -313,7 +312,7 @@ class Router:
                 self._config.proxy.header_priority,
             )
             url = f"{ep.url}{path}"
-            timeout = ep.timeout_ms / 1000.0
+            timeout = step.timeout_ms / 1000.0
             t0 = time.monotonic()
 
             try:

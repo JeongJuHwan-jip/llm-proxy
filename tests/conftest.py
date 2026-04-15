@@ -16,13 +16,11 @@ def minimal_config() -> ProxyConfig:
             EndpointConfig(
                 name="alpha",
                 url="https://alpha.example.com/v1",
-                timeout_ms=5000,
                 headers={"X-ID": "{{uuid}}"},
             ),
             EndpointConfig(
                 name="beta",
                 url="https://beta.example.com/v1",
-                timeout_ms=8000,
             ),
         ],
         failover=FailoverConfig(

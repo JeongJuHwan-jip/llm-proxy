@@ -44,7 +44,6 @@ class EndpointConfig(BaseModel):
 
     name: str
     url: str
-    timeout_ms: int = Field(default=10000, gt=0)
     headers: dict[str, str] = Field(default_factory=dict)
 
     @field_validator("url")
@@ -81,8 +80,9 @@ class AuthConfig(BaseModel):
 class RouteStepConfig(BaseModel):
     """One step in a route chain: which endpoint to use and which model to request.
 
-    ``endpoint`` — must match a name in the top-level ``endpoints:`` list.
-    ``model``    — model name sent to that endpoint for this step.
+    ``endpoint``   — must match a name in the top-level ``endpoints:`` list.
+    ``model``      — model name sent to that endpoint for this step.
+    ``timeout_ms`` — per-step request timeout in milliseconds (default 10 000).
 
     The same endpoint can appear multiple times in a chain with different models:
       e1/m1 → e2/m2 → e1/m2 → e2/m3 → …
@@ -91,6 +91,7 @@ class RouteStepConfig(BaseModel):
 
     endpoint: str   # references EndpointConfig.name
     model: str
+    timeout_ms: int = Field(default=10000, gt=0)
 
 
 class RouteConfig(BaseModel):

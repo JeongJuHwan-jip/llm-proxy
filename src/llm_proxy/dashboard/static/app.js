@@ -247,21 +247,33 @@ function createRouteCard(route) {
   (route.chain || []).forEach((step, i) => {
     const ep = step.server || step.endpoint || '';
     const model = step.model || '';
-    chain.appendChild(createChainItem(ep, model, i + 1));
+    const timeout = step.timeout_ms || 10000;
+    chain.appendChild(createChainItem(ep, model, i + 1, timeout));
   });
   renumberChain(chain);
 
   return card;
 }
 
-function createChainItem(endpoint, model, order) {
+function createChainItem(endpoint, model, order, timeoutMs) {
+  const tms = timeoutMs || 10000;
+  const timeoutInput = mk('input', {
+    className: 'chain-timeout', type: 'number', min: '100', step: '500',
+    value: String(tms), title: 'Timeout (ms)',
+  });
+  timeoutInput.style.width = '70px';
+  timeoutInput.style.marginLeft = '6px';
+  timeoutInput.style.fontSize = '0.85em';
   const item = mk('div', { className: 'chain-item', draggable: 'true' },
     mk('span', { className: 'chain-order', textContent: String(order || '') }),
     mk('span', { className: 'ep-tag', textContent: endpoint }),
     mk('span', { className: 'model-name', textContent: model }),
+    timeoutInput,
+    mk('span', { className: 'timeout-unit', textContent: 'ms' }),
   );
   item.dataset.endpoint = endpoint;
   item.dataset.model = model;
+  item.dataset.timeoutMs = String(tms);
 
   const removeBtn = mk('button', { className: 'chain-remove', textContent: '\u00D7', title: 'Remove from chain' });
   removeBtn.addEventListener('click', () => {
@@ -301,7 +313,9 @@ function onPaletteDragStart(e) {
 function onChainDragStart(e) {
   dragSource = e.currentTarget;
   dragOrigin = 'chain';
-  dragData = { endpoint: dragSource.dataset.endpoint, model: dragSource.dataset.model };
+  const tInput = dragSource.querySelector('.chain-timeout');
+  const tms = tInput ? parseInt(tInput.value, 10) || 10000 : 10000;
+  dragData = { endpoint: dragSource.dataset.endpoint, model: dragSource.dataset.model, timeoutMs: tms };
   dragSource.classList.add('dragging');
   e.dataTransfer.effectAllowed = 'move';
   e.dataTransfer.setData('text/plain', `${dragData.endpoint}/${dragData.model}`);
@@ -350,7 +364,7 @@ function setupDropZone(chain) {
       dragSource.remove();
     }
 
-    const newItem = createChainItem(dragData.endpoint, dragData.model, 0);
+    const newItem = createChainItem(dragData.endpoint, dragData.model, 0, dragData.timeoutMs);
     const items = [...chain.querySelectorAll('.chain-item')];
     if (insertIdx >= items.length) {
       chain.appendChild(newItem);
@@ -395,7 +409,9 @@ function collectRoutingData() {
     card.querySelectorAll('.chain-item').forEach(item => {
       const ep = item.dataset.endpoint;
       const mdl = item.dataset.model;
-      if (ep && mdl) chain.push({ endpoint: ep, model: mdl });
+      const tInput = item.querySelector('.chain-timeout');
+      const tms = tInput ? parseInt(tInput.value, 10) || 10000 : 10000;
+      if (ep && mdl) chain.push({ endpoint: ep, model: mdl, timeout_ms: tms });
     });
     if (chain.length) routes.push({ name, chain });
   });

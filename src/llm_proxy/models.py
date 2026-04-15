@@ -17,7 +17,6 @@ class EndpointState:
 
     name: str
     url: str                              # base URL (no trailing slash)
-    timeout_ms: int
     headers: dict[str, str]              # raw headers (templates not yet resolved)
 
     # circuit breaker
@@ -52,15 +51,19 @@ class EndpointState:
         return self.total_failures / self.total_requests
 
 
+DEFAULT_TIMEOUT_MS: int = 10000
+
 @dataclass
 class RouteStep:
     """One step in a named route: the endpoint to try and the model to request.
 
-    ``model`` is the model name sent to this specific endpoint.
+    ``model``      — model name sent to this specific endpoint.
+    ``timeout_ms`` — per-step request timeout in milliseconds.
     """
 
     endpoint: EndpointState
     model: str | None
+    timeout_ms: int = DEFAULT_TIMEOUT_MS
 
 
 # RoutingTable maps route-name → ordered list of RouteStep.

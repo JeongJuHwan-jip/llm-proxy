@@ -56,9 +56,9 @@ def proxy_config(mock_servers, tmp_path) -> ProxyConfig:
     return ProxyConfig(
         proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
         endpoints=[
-            EndpointConfig(name="alpha", url=mock_servers["alpha"].url, timeout_ms=1000),
-            EndpointConfig(name="beta", url=mock_servers["beta"].url, timeout_ms=5000),
-            EndpointConfig(name="gamma", url=mock_servers["gamma"].url, timeout_ms=5000),
+            EndpointConfig(name="alpha", url=mock_servers["alpha"].url),
+            EndpointConfig(name="beta", url=mock_servers["beta"].url),
+            EndpointConfig(name="gamma", url=mock_servers["gamma"].url),
         ],
         failover=FailoverConfig(
             max_retries=3,
@@ -70,9 +70,9 @@ def proxy_config(mock_servers, tmp_path) -> ProxyConfig:
             RouteConfig(
                 name="test-route",
                 chain=[
-                    RouteStepConfig(endpoint="alpha", model="mock-model"),
-                    RouteStepConfig(endpoint="beta", model="mock-model"),
-                    RouteStepConfig(endpoint="gamma", model="mock-model"),
+                    RouteStepConfig(endpoint="alpha", model="mock-model", timeout_ms=1000),
+                    RouteStepConfig(endpoint="beta", model="mock-model", timeout_ms=5000),
+                    RouteStepConfig(endpoint="gamma", model="mock-model", timeout_ms=5000),
                 ],
             ),
         ],
@@ -214,8 +214,8 @@ class TestAnthropicErrors:
         config = ProxyConfig(
             proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
             endpoints=[
-                EndpointConfig(name="alpha", url=mock_servers["alpha"].url, timeout_ms=500),
-                EndpointConfig(name="beta", url=mock_servers["beta"].url, timeout_ms=5000),
+                EndpointConfig(name="alpha", url=mock_servers["alpha"].url),
+                EndpointConfig(name="beta", url=mock_servers["beta"].url),
             ],
             failover=FailoverConfig(max_retries=2),
             logging=LoggingConfig(db_path=str(tmp_path / "test.db")),
@@ -223,8 +223,8 @@ class TestAnthropicErrors:
                 RouteConfig(
                     name="doomed",
                     chain=[
-                        RouteStepConfig(endpoint="alpha", model="mock-model"),
-                        RouteStepConfig(endpoint="beta", model="mock-model"),
+                        RouteStepConfig(endpoint="alpha", model="mock-model", timeout_ms=500),
+                        RouteStepConfig(endpoint="beta", model="mock-model", timeout_ms=5000),
                     ],
                 ),
             ],
@@ -323,8 +323,8 @@ class TestAnthropicStreaming:
         config = ProxyConfig(
             proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
             endpoints=[
-                EndpointConfig(name="alpha", url=mock_servers["alpha"].url, timeout_ms=500),
-                EndpointConfig(name="beta", url=mock_servers["beta"].url, timeout_ms=5000),
+                EndpointConfig(name="alpha", url=mock_servers["alpha"].url),
+                EndpointConfig(name="beta", url=mock_servers["beta"].url),
             ],
             failover=FailoverConfig(max_retries=2),
             logging=LoggingConfig(db_path=str(tmp_path / "test.db")),
@@ -332,8 +332,8 @@ class TestAnthropicStreaming:
                 RouteConfig(
                     name="doomed",
                     chain=[
-                        RouteStepConfig(endpoint="alpha", model="mock-model"),
-                        RouteStepConfig(endpoint="beta", model="mock-model"),
+                        RouteStepConfig(endpoint="alpha", model="mock-model", timeout_ms=500),
+                        RouteStepConfig(endpoint="beta", model="mock-model", timeout_ms=5000),
                     ],
                 ),
             ],

@@ -528,7 +528,8 @@ def _resolve_route(
         ep_name, _, actual_model = model_id.partition("/")
         ep = router.get_endpoint_by_name(ep_name)
         if ep is not None:
-            return [RouteStep(ep, actual_model)], actual_model, True
+            from .models import DEFAULT_TIMEOUT_MS
+            return [RouteStep(ep, actual_model, DEFAULT_TIMEOUT_MS)], actual_model, True
 
     # 2. Named route only
     steps = router.get_route(model_id)
@@ -690,7 +691,7 @@ async def _handle_stream(
                 _resolve(ep.headers), extra_headers, cfg.proxy.header_priority,
             )
             url = f"{ep.url}{path}"
-            timeout = ep.timeout_ms / 1000.0
+            timeout = step.timeout_ms / 1000.0
             logger.debug(
                 "Upstream request → %s  headers=%s  model=%s",
                 url, headers, model_for_step,
@@ -821,11 +822,12 @@ async def _handle_list_models(request: Request) -> JSONResponse:
     # --- Section 1: endpoint/model direct entries (live fetch) ------------
     async def _fetch(ep: EndpointState) -> list[dict]:
         try:
+            from .models import DEFAULT_TIMEOUT_MS
             headers = _resolve(ep.headers)
             resp = await client.get(
                 f"{ep.url}/models",
                 headers=headers,
-                timeout=ep.timeout_ms / 1000.0,
+                timeout=DEFAULT_TIMEOUT_MS / 1000.0,
             )
             if resp.status_code == 200:
                 data = resp.json().get("data", [])
@@ -896,12 +898,13 @@ async def _handle_passthrough(request: Request, upstream_path: str) -> Response:
         body_bytes = await request.body()
 
     try:
+        from .models import DEFAULT_TIMEOUT_MS
         upstream = await client.request(
             method=request.method,
             url=url,
             content=body_bytes or None,
             headers=headers,
-            timeout=ep.timeout_ms / 1000.0,
+            timeout=DEFAULT_TIMEOUT_MS / 1000.0,
         )
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc))
