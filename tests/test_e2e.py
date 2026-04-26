@@ -143,6 +143,25 @@ class TestE2EFailover:
         assert "data:" in body
         assert "gamma" in body
 
+    def test_streaming_request_logged(self, proxy_config):
+        """Streaming requests must also be persisted to the request log
+        (regression guard: byte_generator's finally block previously fire-and-
+        forgot run_in_executor without awaiting it)."""
+        app = create_app(proxy_config)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/v1/chat/completions", json=_chat_body(stream=True))
+            assert resp.status_code == 200
+            _ = resp.text  # drain body so generator's finally runs
+            log_resp = client.get("/api/requests?limit=1")
+
+        assert log_resp.status_code == 200
+        data = log_resp.json()
+        assert data["total"] >= 1
+        row = data["rows"][0]
+        assert row["status"] == "success"
+        assert row["is_stream"] is True
+        assert row["selected_endpoint"] == "gamma"
+
 
 class TestE2EAllFail:
     """When every endpoint in the chain fails, the proxy should return 502."""
@@ -235,7 +254,7 @@ class TestE2EErrorServer:
     def error_server_408(self):
         """Mock upstream returning 408 Request Timeout."""
         port = get_free_port()
-        app = create_mock_upstream(behavior="error", name="timeout-ep", status_code=408)
+        app = create_mock_upstream(behavior="error", name="error-408", status_code=408)
         server = MockServer(app, port)
         server.start()
         yield server
@@ -245,7 +264,7 @@ class TestE2EErrorServer:
     def error_server_429(self):
         """Mock upstream returning 429 Rate Limited."""
         port = get_free_port()
-        app = create_mock_upstream(behavior="error", name="ratelimit-ep", status_code=429)
+        app = create_mock_upstream(behavior="error", name="error-429", status_code=429)
         server = MockServer(app, port)
         server.start()
         yield server

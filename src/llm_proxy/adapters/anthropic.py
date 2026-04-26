@@ -769,7 +769,7 @@ async def _handle_anthropic_stream(
                 total_latency_ms=total_ms, is_stream=True,
                 request_body=log_body,
             )
-            asyncio.get_event_loop().run_in_executor(None, db.insert_request_log, log)
+            await loop.run_in_executor(None, db.insert_request_log, log)
             events.publish()
 
     return StreamingResponse(

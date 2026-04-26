@@ -56,3 +56,5 @@ No linter or type-checker is configured.
 - `test_anthropic_e2e.py` — Anthropic adapter e2e tests: non-streaming, streaming, direct, failover, error format, OpenAI regression
 
 E2E tests must use `tmp_path` for `db_path` (not `:memory:`) to avoid `resolve_settings_path` picking up a stray `settings.json` from CWD.
+
+**Test catalog ([tests/TESTS.ko.md](tests/TESTS.ko.md)):** Korean-language summary of every test and what it verifies. Whenever a test is added, renamed, removed, or its intent changes, update `tests/TESTS.ko.md` in the same change so the catalog stays in sync with the suite.

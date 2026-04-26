@@ -9,7 +9,16 @@ import pytest
 import pytest_asyncio
 from fastapi.testclient import TestClient
 
-from llm_proxy.config import AuthConfig, EndpointConfig, FailoverConfig, LoggingConfig, ProxyConfig, ProxyServerConfig
+from llm_proxy.config import (
+    AuthConfig,
+    EndpointConfig,
+    FailoverConfig,
+    LoggingConfig,
+    ProxyConfig,
+    ProxyServerConfig,
+    RouteConfig,
+    RouteStepConfig,
+)
 from llm_proxy.server import create_app
 
 
@@ -19,7 +28,9 @@ from llm_proxy.server import create_app
 
 
 @pytest.fixture
-def config_no_auth() -> ProxyConfig:
+def config_no_auth(tmp_path) -> ProxyConfig:
+    """Use tmp_path for db_path so resolve_settings_path doesn't pick up
+    a stray settings.json from CWD that would override our inline routing."""
     return ProxyConfig(
         proxy=ProxyServerConfig(host="127.0.0.1", port=8000),
         endpoints=[
@@ -29,7 +40,13 @@ def config_no_auth() -> ProxyConfig:
             )
         ],
         failover=FailoverConfig(max_retries=0, circuit_breaker_threshold=3),
-        logging=LoggingConfig(db_path=":memory:", log_request_body=False),
+        logging=LoggingConfig(db_path=str(tmp_path / "test.db"), log_request_body=False),
+        routing=[
+            RouteConfig(
+                name="gpt-4",
+                chain=[RouteStepConfig(endpoint="mock-ep", model="gpt-4")],
+            ),
+        ],
     )
 
 

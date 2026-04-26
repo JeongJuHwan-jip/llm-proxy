@@ -12,6 +12,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from llm_proxy.config import (
+    AuthConfig,
     EndpointConfig,
     FailoverConfig,
     LoggingConfig,
@@ -239,6 +240,57 @@ class TestAnthropicErrors:
         assert data["error"]["type"] == "api_error"
 
 
+class TestAnthropicAuth:
+    """The /v1/messages endpoint must enforce the same API-key middleware
+    as /v1/chat/completions."""
+
+    @pytest.fixture
+    def auth_config(self, mock_servers, tmp_path) -> ProxyConfig:
+        return ProxyConfig(
+            proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
+            endpoints=[
+                EndpointConfig(name="gamma", url=mock_servers["gamma"].url),
+            ],
+            failover=FailoverConfig(max_retries=0),
+            logging=LoggingConfig(db_path=str(tmp_path / "test.db")),
+            auth=AuthConfig(api_keys=["valid-key"]),
+            routing=[
+                RouteConfig(
+                    name="r",
+                    chain=[RouteStepConfig(endpoint="gamma", model="mock-model")],
+                ),
+            ],
+        )
+
+    def test_rejects_missing_key(self, auth_config):
+        app = create_app(auth_config)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/v1/messages", json=_anthropic_body("r"))
+        assert resp.status_code == 401
+
+    def test_rejects_wrong_key(self, auth_config):
+        app = create_app(auth_config)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/v1/messages",
+                headers={"Authorization": "Bearer wrong-key"},
+                json=_anthropic_body("r"),
+            )
+        assert resp.status_code == 401
+
+    def test_accepts_valid_key(self, auth_config):
+        app = create_app(auth_config)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post(
+                "/v1/messages",
+                headers={"Authorization": "Bearer valid-key"},
+                json=_anthropic_body("r"),
+            )
+        assert resp.status_code == 200
+        assert resp.json()["type"] == "message"
+
+
+
 # ---------------------------------------------------------------------------
 # Tests — Streaming
 # ---------------------------------------------------------------------------
@@ -257,19 +309,32 @@ class TestAnthropicStreaming:
         assert "text/event-stream" in ct
 
     def test_streaming_event_sequence(self, proxy_config):
-        """Verify the Anthropic SSE event sequence."""
+        """Verify the Anthropic SSE events arrive in spec-compliant order."""
         app = create_app(proxy_config)
         with TestClient(app, raise_server_exceptions=False) as client:
             resp = client.post("/v1/messages", json=_anthropic_body(stream=True))
 
-        body = resp.text
-        # Must contain the key Anthropic event types
-        assert "event: message_start" in body
-        assert "event: content_block_start" in body
-        assert "event: content_block_delta" in body
-        assert "event: content_block_stop" in body
-        assert "event: message_delta" in body
-        assert "event: message_stop" in body
+        # Extract event types in arrival order
+        events = [
+            line.removeprefix("event: ").strip()
+            for line in resp.text.split("\n")
+            if line.startswith("event: ")
+        ]
+        assert events, "no SSE events found"
+
+        # Anthropic spec ordering:
+        #   message_start → (ping)? → content_block_start → content_block_delta+
+        #   → content_block_stop → message_delta → message_stop
+        assert events[0] == "message_start"
+        assert events[-1] == "message_stop"
+        assert events[-2] == "message_delta"
+        # First content block event must be a start, before any delta
+        first_cb_start = events.index("content_block_start")
+        first_cb_delta = events.index("content_block_delta")
+        first_cb_stop = events.index("content_block_stop")
+        assert first_cb_start < first_cb_delta < first_cb_stop
+        # message_delta must come after every content_block_stop
+        assert first_cb_stop < events.index("message_delta")
 
     def test_streaming_contains_text(self, proxy_config):
         """The streamed text should contain gamma's response."""
@@ -279,6 +344,26 @@ class TestAnthropicStreaming:
 
         body = resp.text
         assert "gamma" in body
+
+    def test_streaming_request_logged(self, proxy_config):
+        """Streaming requests must also be persisted to the request log
+        (regression guard: the streaming finally-block previously fire-and-
+        forgot run_in_executor without awaiting it)."""
+        app = create_app(proxy_config)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            resp = client.post("/v1/messages", json=_anthropic_body(stream=True))
+            # Drain the body so the wrapped_generator's finally block runs
+            assert resp.status_code == 200
+            _ = resp.text
+            log_resp = client.get("/api/requests?limit=1")
+
+        assert log_resp.status_code == 200
+        data = log_resp.json()
+        assert data["total"] >= 1
+        row = data["rows"][0]
+        assert row["status"] == "success"
+        assert row["is_stream"] is True
+        assert row["selected_endpoint"] == "gamma"
 
     def test_streaming_message_start_has_model(self, proxy_config):
         """message_start event should have the model field."""
