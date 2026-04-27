@@ -18,6 +18,7 @@ class EndpointState:
     name: str
     url: str                              # base URL (no trailing slash)
     headers: dict[str, str]              # raw headers (templates not yet resolved)
+    ssl_verify: bool = True              # whether to verify TLS certificates
 
     # circuit breaker
     circuit_state: CircuitState = "closed"
