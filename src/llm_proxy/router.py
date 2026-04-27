@@ -69,6 +69,7 @@ class Router:
                 name=ep.name,
                 url=ep.url,
                 headers=ep.headers,
+                ssl_verify=ep.ssl_verify,
             )
 
         table: RoutingTable = {}
@@ -269,7 +270,7 @@ class Router:
 
     async def execute(
         self,
-        client: "httpx.AsyncClient",
+        client: "httpx.AsyncClient | dict[bool, httpx.AsyncClient]",
         path: str,
         body: dict,
         extra_headers: dict[str, str],
@@ -314,9 +315,10 @@ class Router:
             url = f"{ep.url}{path}"
             timeout = step.timeout_ms / 1000.0
             t0 = time.monotonic()
+            _client = client[ep.ssl_verify] if isinstance(client, dict) else client
 
             try:
-                response = await client.post(url, json=body_for_step, headers=headers, timeout=timeout)
+                response = await _client.post(url, json=body_for_step, headers=headers, timeout=timeout)
                 latency_ms = (time.monotonic() - t0) * 1000
 
                 if _should_failover(response.status_code):

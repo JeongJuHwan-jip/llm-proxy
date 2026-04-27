@@ -67,7 +67,7 @@ class DiscoveryDiff:
 
 
 async def run_discovery(
-    client: "httpx.AsyncClient",
+    client: "httpx.AsyncClient | dict[bool, httpx.AsyncClient]",
     endpoints: list["EndpointState"],
 ) -> DiscoveryResult:
     """Concurrently query /v1/models on all endpoints and aggregate results."""
@@ -81,7 +81,8 @@ async def run_discovery(
     async def _fetch(idx: int, ep: "EndpointState") -> None:
         try:
             headers = resolve_headers(ep.headers)
-            resp = await client.get(
+            _c = client.get(ep.ssl_verify, client.get(True)) if isinstance(client, dict) else client
+            resp = await _c.get(
                 f"{ep.url}/models",
                 headers=headers,
                 timeout=5.0,

@@ -107,13 +107,21 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         cfg: ProxyConfig = app.state.config
         config_path: Path | None = getattr(app.state, "config_path", None) or config_path_from_cli
 
-        # HTTP client — shared connection pool
+        # HTTP clients — one per ssl_verify value (True/False)
         limits = httpx.Limits(
             max_connections=200,
             max_keepalive_connections=50,
             keepalive_expiry=30,
         )
-        client = httpx.AsyncClient(limits=limits, follow_redirects=False)
+        client = httpx.AsyncClient(limits=limits, follow_redirects=False, verify=True)
+        needs_nossl = any(not ep.ssl_verify for ep in cfg.endpoints)
+        client_nossl = (
+            httpx.AsyncClient(limits=limits, follow_redirects=False, verify=False)
+            if needs_nossl else None
+        )
+        clients: dict[bool, httpx.AsyncClient] = {True: client}
+        if client_nossl is not None:
+            clients[False] = client_nossl
 
         router = Router(cfg)
         db = Database(cfg.logging.db_path)
@@ -122,6 +130,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         await loop.run_in_executor(None, db.init)
 
         app.state.client = client
+        app.state.clients = clients
         app.state.router = router
         app.state.db = db
         app.state.events = EventBroadcaster()
@@ -147,7 +156,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         snapshot_path = Path(cfg.logging.db_path).parent / "model_snapshot.json"
         old_snapshot = load_snapshot(snapshot_path)
 
-        discovery = await run_discovery(client, router.all_endpoints())
+        discovery = await run_discovery(clients, router.all_endpoints())
         router.update_routing_from_discovery(discovery.models)
         save_snapshot(snapshot_path, discovery)
 
@@ -169,6 +178,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         yield
 
         await client.aclose()
+        if client_nossl is not None:
+            await client_nossl.aclose()
         await loop.run_in_executor(None, db.close)
 
     app = FastAPI(
@@ -542,7 +553,7 @@ def _resolve_route(
 
 
 async def _handle_proxy(request: Request, upstream_path: str) -> Response:
-    client: httpx.AsyncClient = request.app.state.client
+    clients: dict[bool, httpx.AsyncClient] = request.app.state.clients
     router: Router = request.app.state.router
     db: Database = request.app.state.db
     cfg: ProxyConfig = request.app.state.config
@@ -572,7 +583,7 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
 
     if is_stream:
         return await _handle_stream(
-            client, router, db, cfg, events,
+            clients, router, db, cfg, events,
             upstream_path, body, forward_headers,
             raw_model, log_body, t_start,
             steps=steps, fallback_model=fallback_model,
@@ -581,7 +592,7 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
     else:
         try:
             result = await _handle_normal(
-                client, router, db, cfg,
+                clients, router, db, cfg,
                 upstream_path, body, forward_headers,
                 raw_model, log_body, t_start,
                 steps=steps, fallback_model=fallback_model,
@@ -593,7 +604,7 @@ async def _handle_proxy(request: Request, upstream_path: str) -> Response:
 
 
 async def _handle_normal(
-    client: httpx.AsyncClient,
+    clients: dict[bool, httpx.AsyncClient],
     router: Router,
     db: Database,
     cfg: ProxyConfig,
@@ -610,7 +621,7 @@ async def _handle_normal(
     loop = asyncio.get_event_loop()
     try:
         response, winning_step, attempts = await router.execute(
-            client, path, body, extra_headers, steps, fallback_model,
+            clients, path, body, extra_headers, steps, fallback_model,
             is_direct=is_direct,
         )
     except AllEndpointsFailedError as exc:
@@ -649,7 +660,7 @@ async def _handle_normal(
 
 
 async def _handle_stream(
-    client: httpx.AsyncClient,
+    clients: dict[bool, httpx.AsyncClient],
     router: Router,
     db: Database,
     cfg: ProxyConfig,
@@ -697,11 +708,12 @@ async def _handle_stream(
                 url, headers, model_for_step,
             )
             t0 = time.monotonic()
+            _c = clients.get(ep.ssl_verify, clients[True])
             try:
                 # httpx >=0.20: timeout must be in request extensions, not send()
                 _t = {"connect": timeout, "read": timeout, "write": timeout, "pool": timeout}
-                resp = await client.send(
-                    client.build_request(
+                resp = await _c.send(
+                    _c.build_request(
                         "POST", url, json=body_for_step, headers=headers,
                         extensions={"timeout": _t},
                     ),
@@ -814,7 +826,7 @@ async def _handle_list_models(request: Request) -> JSONResponse:
     import time as _time
     from .config import resolve_headers as _resolve
 
-    client: httpx.AsyncClient = request.app.state.client
+    clients: dict[bool, httpx.AsyncClient] = request.app.state.clients
     router: Router = request.app.state.router
 
     # --- Section 1: endpoint/model direct entries (live fetch) ------------
@@ -822,7 +834,8 @@ async def _handle_list_models(request: Request) -> JSONResponse:
         try:
             from .models import DEFAULT_TIMEOUT_MS
             headers = _resolve(ep.headers)
-            resp = await client.get(
+            _c = clients.get(ep.ssl_verify, clients[True])
+            resp = await _c.get(
                 f"{ep.url}/models",
                 headers=headers,
                 timeout=DEFAULT_TIMEOUT_MS / 1000.0,
@@ -871,7 +884,7 @@ async def _handle_passthrough(request: Request, upstream_path: str) -> Response:
     """Forward non-chat requests to the first reachable upstream as-is.
     No failover logic — just forward with the correct HTTP method.
     """
-    client: httpx.AsyncClient = request.app.state.client
+    clients: dict[bool, httpx.AsyncClient] = request.app.state.clients
     router: Router = request.app.state.router
 
     all_eps = router.all_endpoints()
@@ -897,7 +910,8 @@ async def _handle_passthrough(request: Request, upstream_path: str) -> Response:
 
     try:
         from .models import DEFAULT_TIMEOUT_MS
-        upstream = await client.request(
+        _c = clients.get(ep.ssl_verify, clients[True])
+        upstream = await _c.request(
             method=request.method,
             url=url,
             content=body_bytes or None,

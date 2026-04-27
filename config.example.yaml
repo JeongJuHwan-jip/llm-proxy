@@ -30,6 +30,12 @@ endpoints:
   - name: "gamma"
     url: "https://gamma.company.com/v1"
 
+  # Example: disable SSL certificate verification for a self-signed / internal endpoint.
+  # WARNING: only use this for trusted internal networks — it disables MITM protection.
+  # - name: "internal"
+  #   url: "https://internal.corp.local/v1"
+  #   ssl_verify: false
+
 # Failover and routing are managed via the dashboard GUI.
 # When you click "Apply Settings" in the dashboard, a settings.json file
 # is auto-generated next to this config file.  No manual editing needed.

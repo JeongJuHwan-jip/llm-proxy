@@ -34,6 +34,9 @@
 - **test_load_config_invalid_url_raises** — `ftp://` 같은 비-HTTP URL이면 예외.
 - **test_load_config_env_key** — `auth.api_keys` 안에서도 `{{env:...}}` 치환이 동작.
 - **test_load_config_missing_file** — 존재하지 않는 파일 경로에 대해 `FileNotFoundError`.
+- **test_ssl_verify_default_is_true** — `ssl_verify` 옵션을 명시하지 않으면 기본값 `True`(SSL 검증 활성화)로 로딩.
+- **test_ssl_verify_can_be_disabled** — `ssl_verify: false`로 설정하면 `False`로 로딩.
+- **test_ssl_verify_propagates_to_endpoint_state** — `ssl_verify: false`로 설정된 엔드포인트가 `EndpointState.ssl_verify == False`로 전파.
 - **test_same_endpoint_appears_twice_in_chain** — 같은 엔드포인트가 한 체인에 두 번 등장(다른 모델 사용)할 수 있고, `EndpointState`(서킷 브레이커)는 공유됨.
 
 ---

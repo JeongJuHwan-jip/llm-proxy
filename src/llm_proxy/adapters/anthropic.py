@@ -507,7 +507,7 @@ async def handle_anthropic_messages(request: Request) -> Response:
     from ..server import EventBroadcaster, _resolve_route, _STRIP_HEADERS, merge_headers
     from ..config import ProxyConfig, resolve_headers as _resolve
 
-    client: httpx.AsyncClient = request.app.state.client
+    clients: dict[bool, httpx.AsyncClient] = request.app.state.clients
     router: Router = request.app.state.router
     db = request.app.state.db
     cfg: ProxyConfig = request.app.state.config
@@ -550,14 +550,14 @@ async def handle_anthropic_messages(request: Request) -> Response:
 
     if is_stream:
         return await _handle_anthropic_stream(
-            client, router, db, cfg, events,
+            clients, router, db, cfg, events,
             oai_body, forward_headers, original_model,
             log_body, t_start, steps, fallback_model, is_direct,
         )
     else:
         try:
             result = await _handle_anthropic_normal(
-                client, router, db, cfg,
+                clients, router, db, cfg,
                 oai_body, forward_headers, original_model,
                 log_body, t_start, steps, fallback_model, is_direct,
             )
@@ -567,7 +567,7 @@ async def handle_anthropic_messages(request: Request) -> Response:
 
 
 async def _handle_anthropic_normal(
-    client: httpx.AsyncClient,
+    clients: "dict[bool, httpx.AsyncClient]",
     router: "Router",
     db: Any,
     cfg: Any,
@@ -585,7 +585,7 @@ async def _handle_anthropic_normal(
 
     try:
         response, winning_step, attempts = await router.execute(
-            client, "/chat/completions", oai_body, forward_headers,
+            clients, "/chat/completions", oai_body, forward_headers,
             steps, fallback_model, is_direct=is_direct,
         )
     except AllEndpointsFailedError as exc:
@@ -629,7 +629,7 @@ async def _handle_anthropic_normal(
 
 
 async def _handle_anthropic_stream(
-    client: httpx.AsyncClient,
+    clients: "dict[bool, httpx.AsyncClient]",
     router: "Router",
     db: Any,
     cfg: Any,
@@ -678,8 +678,9 @@ async def _handle_anthropic_stream(
 
         try:
             _t = {"connect": timeout, "read": timeout, "write": timeout, "pool": timeout}
-            resp = await client.send(
-                client.build_request(
+            _c = clients.get(ep.ssl_verify, clients[True])
+            resp = await _c.send(
+                _c.build_request(
                     "POST", url, json=body_for_step, headers=headers,
                     extensions={"timeout": _t},
                 ),

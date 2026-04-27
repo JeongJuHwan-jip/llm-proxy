@@ -166,6 +166,51 @@ def test_load_config_missing_file():
         load_config("/nonexistent/path/config.yaml")
 
 
+def test_ssl_verify_default_is_true():
+    cfg_data = {
+        "endpoints": [{"name": "ep", "url": "https://ep.example.com/v1"}]
+    }
+    path = _write_config(cfg_data)
+    try:
+        cfg = load_config(path)
+        assert cfg.endpoints[0].ssl_verify is True
+    finally:
+        path.unlink()
+
+
+def test_ssl_verify_can_be_disabled():
+    cfg_data = {
+        "endpoints": [
+            {"name": "internal", "url": "https://internal.local/v1", "ssl_verify": False}
+        ]
+    }
+    path = _write_config(cfg_data)
+    try:
+        cfg = load_config(path)
+        assert cfg.endpoints[0].ssl_verify is False
+    finally:
+        path.unlink()
+
+
+def test_ssl_verify_propagates_to_endpoint_state():
+    from llm_proxy.router import Router
+
+    cfg_data = {
+        "endpoints": [
+            {"name": "ep", "url": "https://ep.example.com/v1", "ssl_verify": False}
+        ]
+    }
+    path = _write_config(cfg_data)
+    try:
+        cfg = load_config(path)
+        router = Router(cfg)
+        ep_state = router.get_endpoint_by_name("ep")
+        assert ep_state is not None
+        assert ep_state.ssl_verify is False
+    finally:
+        path.unlink()
+
+
 def test_same_endpoint_appears_twice_in_chain(minimal_config):
     """The same endpoint can appear twice in a chain with different models."""
     from llm_proxy.config import RouteConfig, RouteStepConfig

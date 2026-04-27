@@ -45,6 +45,7 @@ class EndpointConfig(BaseModel):
     name: str
     url: str
     headers: dict[str, str] = Field(default_factory=dict)
+    ssl_verify: bool = True
 
     @field_validator("url")
     @classmethod
