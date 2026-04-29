@@ -174,7 +174,7 @@
 - **test_passthrough_fields** — temperature/top_p/stream 그대로 전달.
 - **test_top_k_dropped** — OpenAI 미지원, 삭제됨.
 - **test_metadata_dropped** — metadata 삭제.
-- **test_thinking_raises** — `thinking` 필드는 V1 미지원, ValueError.
+- **test_thinking_passthrough** — `thinking` 필드(예: `{type:"enabled", budget_tokens}`)는 OpenAI 본문에 그대로 전달(상류가 확장 사고 지원 시 사용, 미지원 시 무시).
 - **test_tool_definitions_translated** — Anthropic tool 정의 → OpenAI `{type:"function", function:{name, description, parameters}}` 형식.
 - **test_tool_choice_auto** — `{type:"auto"}` → `"auto"`.
 - **test_tool_choice_any_maps_to_required** — `{type:"any"}` → `"required"`.

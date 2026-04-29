@@ -55,16 +55,16 @@ _FINISH_REASON_MAP = {
 def translate_request(body: dict[str, Any]) -> dict[str, Any]:
     """Translate an Anthropic Messages API request body to OpenAI format.
 
-    Pure function — no side effects.  Raises ``ValueError`` for unsupported
-    features (e.g. ``thinking``).
+    Pure function — no side effects.
     """
-    if "thinking" in body:
-        raise ValueError("'thinking' is not supported by this proxy")
-
     oai: dict[str, Any] = {}
 
     # --- Pass-through fields ------------------------------------------------
-    for key in ("model", "max_tokens", "temperature", "top_p", "stream"):
+    # ``thinking`` is forwarded as-is so OpenAI-compatible upstreams that
+    # support extended thinking (LiteLLM, OpenRouter, Anthropic-via-OpenAI,
+    # etc.) can honor it. Upstreams that don't recognize the field typically
+    # ignore it.
+    for key in ("model", "max_tokens", "temperature", "top_p", "stream", "thinking"):
         if key in body:
             oai[key] = body[key]
 
