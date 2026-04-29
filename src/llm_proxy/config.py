@@ -81,9 +81,14 @@ class AuthConfig(BaseModel):
 class RouteStepConfig(BaseModel):
     """One step in a route chain: which endpoint to use and which model to request.
 
-    ``endpoint``   — must match a name in the top-level ``endpoints:`` list.
-    ``model``      — model name sent to that endpoint for this step.
-    ``timeout_ms`` — per-step request timeout in milliseconds (default 10 000).
+    ``endpoint``           — must match a name in the top-level ``endpoints:`` list.
+    ``model``              — model name sent to that endpoint for this step.
+    ``timeout_ms``         — per-step request timeout in milliseconds (default 10 000).
+    ``max_context_tokens`` — optional context-window budget for this (endpoint, model)
+                             pair. Steps whose budget is smaller than the estimated
+                             request size are skipped during failover so a smaller
+                             fallback model never silently truncates / stalls on an
+                             over-long prompt. ``None`` means unbounded.
 
     The same endpoint can appear multiple times in a chain with different models:
       e1/m1 → e2/m2 → e1/m2 → e2/m3 → …
@@ -93,6 +98,7 @@ class RouteStepConfig(BaseModel):
     endpoint: str   # references EndpointConfig.name
     model: str
     timeout_ms: int = Field(default=10000, gt=0)
+    max_context_tokens: int | None = Field(default=None, gt=0)
 
 
 class RouteConfig(BaseModel):

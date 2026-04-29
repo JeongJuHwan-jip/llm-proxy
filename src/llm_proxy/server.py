@@ -346,12 +346,22 @@ def _register_routes(app: FastAPI) -> None:
         router_: Router = app_instance.state.router
         spath: Path = app_instance.state.settings_path
 
+        def _step_dict(endpoint: str, model: str, timeout_ms: int,
+                       max_context_tokens: int | None) -> dict:
+            d: dict = {"endpoint": endpoint, "model": model, "timeout_ms": timeout_ms}
+            if max_context_tokens is not None:
+                d["max_context_tokens"] = max_context_tokens
+            return d
+
         if route_configs is None:
             routed = router_.get_routed_models()
             routes_out = [
                 {
                     "name": rname,
-                    "chain": [{"endpoint": s["server"], "model": s["model"]} for s in chain],
+                    "chain": [
+                        _step_dict(s["server"], s["model"], s["timeout_ms"], s["max_context_tokens"])
+                        for s in chain
+                    ],
                 }
                 for rname, chain in routed.items()
             ]
@@ -359,7 +369,10 @@ def _register_routes(app: FastAPI) -> None:
             routes_out = [
                 {
                     "name": rc.name,
-                    "chain": [{"endpoint": s.endpoint, "model": s.model} for s in rc.chain],
+                    "chain": [
+                        _step_dict(s.endpoint, s.model, s.timeout_ms, s.max_context_tokens)
+                        for s in rc.chain
+                    ],
                 }
                 for rc in route_configs
             ]
@@ -397,7 +410,15 @@ def _register_routes(app: FastAPI) -> None:
                 routes = [
                     {
                         "name": r.name,
-                        "chain": [{"endpoint": s.endpoint, "model": s.model} for s in r.chain],
+                        "chain": [
+                            {
+                                "endpoint": s.endpoint,
+                                "model": s.model,
+                                "timeout_ms": s.timeout_ms,
+                                "max_context_tokens": s.max_context_tokens,
+                            }
+                            for s in r.chain
+                        ],
                     }
                     for r in sdata.routes
                 ]
@@ -690,7 +711,7 @@ async def _handle_stream(
     if is_direct:
         eligible = steps
     else:
-        eligible = router.filter_steps(steps)
+        eligible = router.filter_by_context(router.filter_steps(steps), body)
     if not eligible:
         raise HTTPException(status_code=502, detail="No endpoints available")
 

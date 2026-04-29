@@ -653,7 +653,7 @@ async def _handle_anthropic_stream(
     if is_direct:
         eligible = steps
     else:
-        eligible = router.filter_steps(steps)
+        eligible = router.filter_by_context(router.filter_steps(steps), oai_body)
     if not eligible:
         return anthropic_error("api_error", "No endpoints available", 502)
 

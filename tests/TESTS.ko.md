@@ -14,6 +14,7 @@
 | `test_e2e.py` | 실제 HTTP end-to-end | mock_upstream (uvicorn) |
 | `test_anthropic_adapter.py` | Anthropic 어댑터 변환 함수 단위 테스트 | (순수 함수) |
 | `test_anthropic_e2e.py` | Anthropic 어댑터 e2e | mock_upstream (uvicorn) |
+| `test_context_routing.py` | 모델별 컨텍스트 윈도우(`max_context_tokens`) 기반 페일오버 필터 | AsyncMock httpx |
 
 ---
 
@@ -249,3 +250,37 @@
 
 ### `TestOpenAIRegressionFromAnthropicTests` — OpenAI 회귀 검증
 - **test_openai_chat_still_works** — `/v1/messages` 추가가 기존 `/v1/chat/completions`를 망가뜨리지 않았는지 확인.
+
+---
+
+## test_context_routing.py — 컨텍스트 윈도우 기반 라우팅 필터
+
+서로 다른 컨텍스트 윈도우를 가진 모델들이 한 체인에 묶일 때(예: 1M 모델 → 256K 모델), 큰 요청이 작은 모델로 페일오버해 조용히 잘리거나 멈추는 문제를 막기 위한 필터(`Router.filter_by_context`)와 토큰 추정 함수(`estimate_request_tokens`)를 검증한다.
+
+### `TestEstimateRequestTokens` — 토큰 추정(char/4 휴리스틱)
+- **test_empty_body_is_zero** — 빈 본문 → 0.
+- **test_simple_string_message** — 4자 문자열 content → 1 token.
+- **test_multiple_messages_summed** — 여러 메시지 char 합산 후 4로 나눔.
+- **test_max_tokens_added_to_estimate** — 요청의 `max_tokens`(출력 예약 토큰)도 합산.
+- **test_content_block_array_text_extracted** — `content`가 블록 배열일 때 `text` 필드만 합산.
+- **test_tool_calls_arguments_counted** — assistant 메시지의 `tool_calls.function.arguments` 길이도 합산.
+- **test_tools_definitions_counted** — `tools` 정의 JSON 직렬화 길이를 합산.
+- **test_anthropic_top_level_system_string/blocks** — Anthropic 스타일 top-level `system` (str / 블록 배열) 모두 합산.
+- **test_negative_max_tokens_ignored** — 음수 `max_tokens`는 0으로 처리.
+
+### `TestFilterByContext` — `max_context_tokens`로 step 필터
+- **test_step_kept_when_fits** — 짧은 요청 → 모든 step 통과.
+- **test_small_step_dropped_when_request_too_big** — 1M 모델은 통과, 256K 모델은 제외.
+- **test_all_steps_dropped_when_too_big_for_everyone** — 모든 step의 한도를 초과하면 빈 리스트(상위 호출자가 502 등으로 처리).
+- **test_step_with_no_limit_always_kept** — `max_context_tokens=None`인 step은 항상 통과(언바운디드 의미).
+- **test_max_tokens_output_budget_counted** — 입력만으로는 들어가도 `max_tokens`(출력 예약) 합산 시 초과하면 제외.
+
+### `TestExecuteWithContextFilter` — 페일오버 루프에 필터 적용 통합
+- **test_long_request_skips_small_and_fails_on_big** — big 타임아웃 시 small이 자동 fallback되지 않아야 함(컨텍스트 부족) → `AllEndpointsFailedError` 1회 시도만 기록.
+- **test_long_request_succeeds_on_big_when_big_works** — big이 응답하면 그대로 성공.
+- **test_short_request_falls_over_to_small** — 짧은 요청이면 정상적으로 small까지 페일오버.
+- **test_direct_request_skips_context_filter** — `endpoint/model` 직접 요청(`is_direct=True`)은 사용자가 명시했으므로 컨텍스트 필터를 우회.
+
+### `TestSettingsRoundTrip` — settings.json 라운드트립
+- **test_max_context_tokens_loaded_from_settings_json** — `max_context_tokens` 필드가 chain step에 정상 파싱되며, 미지정 시 `None`.
+- **test_invalid_max_context_tokens_rejected** — `0` 등 양수가 아닌 값은 검증 실패.

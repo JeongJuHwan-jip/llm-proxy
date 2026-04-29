@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import TYPE_CHECKING
@@ -20,6 +21,70 @@ if TYPE_CHECKING:
     import httpx
 
 logger = logging.getLogger(__name__)
+
+
+# Approx. characters per token. A coarse, provider-agnostic heuristic — tighter
+# than nothing (no tokenizer dependencies) and conservative enough for routing
+# decisions where the goal is "skip steps that obviously cannot fit".
+_CHARS_PER_TOKEN = 4
+
+
+def estimate_request_tokens(body: dict) -> int:
+    """Estimate input + reserved-output tokens for a chat-completions request body.
+
+    Walks the OpenAI-shaped body (the Anthropic adapter translates to this shape
+    before calling the router) and sums character counts of every text payload —
+    messages, tool definitions, tool-call arguments, and the (optional) top-level
+    Anthropic ``system`` field if it slipped through. Then divides by
+    ``_CHARS_PER_TOKEN`` and adds the requested ``max_tokens`` so the estimate
+    accounts for the output budget the model has to reserve.
+    """
+    char_count = 0
+
+    # Anthropic-style top-level system (harmless if absent in OpenAI bodies)
+    system = body.get("system")
+    if isinstance(system, str):
+        char_count += len(system)
+    elif isinstance(system, list):
+        for blk in system:
+            if isinstance(blk, dict):
+                t = blk.get("text", "")
+                if isinstance(t, str):
+                    char_count += len(t)
+
+    for msg in body.get("messages", []) or []:
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content")
+        if isinstance(content, str):
+            char_count += len(content)
+        elif isinstance(content, list):
+            for blk in content:
+                if not isinstance(blk, dict):
+                    continue
+                t = blk.get("text", "")
+                if isinstance(t, str):
+                    char_count += len(t)
+        for tc in msg.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            args = tc.get("function", {}).get("arguments", "")
+            if isinstance(args, str):
+                char_count += len(args)
+
+    for tool in body.get("tools") or []:
+        try:
+            char_count += len(json.dumps(tool, ensure_ascii=False))
+        except (TypeError, ValueError):
+            pass
+
+    input_tokens = (char_count + _CHARS_PER_TOKEN - 1) // _CHARS_PER_TOKEN
+
+    output_budget = body.get("max_tokens") or 0
+    if not isinstance(output_budget, int) or output_budget < 0:
+        output_budget = 0
+
+    return input_tokens + output_budget
 
 
 def _should_failover(status_code: int) -> bool:
@@ -80,7 +145,10 @@ class Router:
             for step_cfg in route.chain:
                 ep = self._ep_by_name.get(step_cfg.endpoint)
                 if ep is not None:
-                    steps.append(RouteStep(ep, step_cfg.model, step_cfg.timeout_ms))
+                    steps.append(RouteStep(
+                        ep, step_cfg.model, step_cfg.timeout_ms,
+                        step_cfg.max_context_tokens,
+                    ))
                 else:
                     unknown.append(step_cfg.endpoint)
 
@@ -116,7 +184,10 @@ class Router:
             for step_cfg in route.chain:
                 ep = self._ep_by_name.get(step_cfg.endpoint)
                 if ep is not None:
-                    steps.append(RouteStep(ep, step_cfg.model, step_cfg.timeout_ms))
+                    steps.append(RouteStep(
+                        ep, step_cfg.model, step_cfg.timeout_ms,
+                        step_cfg.max_context_tokens,
+                    ))
                 else:
                     unknown.append(step_cfg.endpoint)
             if unknown:
@@ -155,6 +226,29 @@ class Router:
         """
         return self._table.get(name, [])
 
+    def filter_by_context(
+        self, steps: list[RouteStep], body: dict,
+    ) -> list[RouteStep]:
+        """Drop steps whose ``max_context_tokens`` cannot fit ``body``.
+
+        Steps with ``max_context_tokens=None`` are always kept (treated as
+        unbounded). If every step is filtered out the caller will see an empty
+        list and surface a clear error to the client instead of failing over
+        into a smaller model that would silently truncate the prompt.
+        """
+        estimated = estimate_request_tokens(body)
+        eligible: list[RouteStep] = []
+        for step in steps:
+            limit = step.max_context_tokens
+            if limit is not None and estimated > limit:
+                logger.warning(
+                    "Skipping %r/%r — request ~%d tokens exceeds context limit %d",
+                    step.endpoint.name, step.model, estimated, limit,
+                )
+                continue
+            eligible.append(step)
+        return eligible
+
     def filter_steps(self, steps: list[RouteStep]) -> list[RouteStep]:
         """Remove circuit-OPEN steps; apply latency sort if configured."""
         eligible: list[RouteStep] = []
@@ -175,15 +269,21 @@ class Router:
             )
         return eligible
 
-    def get_routed_models(self) -> dict[str, list[dict[str, str]]]:
+    def get_routed_models(self) -> dict[str, list[dict[str, object]]]:
         """Return named routes as name → chain description.
 
-        Each chain entry is {"server": ep_name, "model": model_id}.
+        Each chain entry is ``{"server": ep_name, "model": model_id,
+        "timeout_ms": int, "max_context_tokens": int | None}``.
         """
-        result: dict[str, list[dict[str, str]]] = {}
+        result: dict[str, list[dict[str, object]]] = {}
         for name, steps in self._table.items():
             result[name] = [
-                {"server": s.endpoint.name, "model": s.model or ""}
+                {
+                    "server": s.endpoint.name,
+                    "model": s.model or "",
+                    "timeout_ms": s.timeout_ms,
+                    "max_context_tokens": s.max_context_tokens,
+                }
                 for s in steps
             ]
         return result
@@ -295,7 +395,7 @@ class Router:
         if is_direct:
             eligible = steps
         else:
-            eligible = self.filter_steps(steps)
+            eligible = self.filter_by_context(self.filter_steps(steps), body)
         if not eligible:
             raise AllEndpointsFailedError([])
 

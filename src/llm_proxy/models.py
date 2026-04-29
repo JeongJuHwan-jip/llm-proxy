@@ -58,13 +58,17 @@ DEFAULT_TIMEOUT_MS: int = 10000
 class RouteStep:
     """One step in a named route: the endpoint to try and the model to request.
 
-    ``model``      — model name sent to this specific endpoint.
-    ``timeout_ms`` — per-step request timeout in milliseconds.
+    ``model``              — model name sent to this specific endpoint.
+    ``timeout_ms``         — per-step request timeout in milliseconds.
+    ``max_context_tokens`` — context-window budget for this step; steps whose
+                             budget cannot fit the estimated request are skipped.
+                             ``None`` means unbounded (no filtering).
     """
 
     endpoint: EndpointState
     model: str | None
     timeout_ms: int = DEFAULT_TIMEOUT_MS
+    max_context_tokens: int | None = None
 
 
 # RoutingTable maps route-name → ordered list of RouteStep.
