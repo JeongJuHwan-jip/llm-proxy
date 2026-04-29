@@ -163,3 +163,9 @@ class Database:
         assert self._conn is not None
         row = self._conn.execute("SELECT COUNT(*) FROM requests").fetchone()
         return row[0] if row else 0
+
+    def clear_all_requests(self) -> int:
+        assert self._conn is not None
+        cur = self._conn.execute("DELETE FROM requests")
+        self._conn.commit()
+        return cur.rowcount
