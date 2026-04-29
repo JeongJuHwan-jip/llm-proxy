@@ -107,15 +107,15 @@ class TestTranslateRequest:
         result = translate_request(body)
         assert "metadata" not in result
 
-    def test_thinking_raises(self):
+    def test_thinking_passthrough(self):
         body = {
             "model": "m",
             "max_tokens": 10,
             "thinking": {"type": "enabled", "budget_tokens": 2048},
             "messages": [{"role": "user", "content": "hi"}],
         }
-        with pytest.raises(ValueError, match="thinking"):
-            translate_request(body)
+        result = translate_request(body)
+        assert result["thinking"] == {"type": "enabled", "budget_tokens": 2048}
 
     def test_tool_definitions_translated(self):
         body = {
