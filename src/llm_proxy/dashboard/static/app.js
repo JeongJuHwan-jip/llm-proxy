@@ -483,3 +483,8 @@ loadSettings();
 initSettingsControls();
 connectSSE();
 document.getElementById('btn-refresh').addEventListener('click', () => refreshMonitor());
+document.getElementById('btn-clear-requests').addEventListener('click', async () => {
+  if (!confirm('모든 요청 기록을 삭제하시겠습니까?')) return;
+  await fetch('/api/requests', { method: 'DELETE' });
+  await refreshMonitor();
+});

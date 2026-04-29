@@ -272,6 +272,13 @@ def _register_routes(app: FastAPI) -> None:
         total = await loop.run_in_executor(None, db.get_total_count)
         return JSONResponse({"total": total, "rows": rows})
 
+    @app.delete("/api/requests")
+    async def api_clear_requests(request: Request) -> JSONResponse:
+        db: Database = request.app.state.db
+        loop = asyncio.get_event_loop()
+        deleted = await loop.run_in_executor(None, db.clear_all_requests)
+        return JSONResponse({"deleted": deleted})
+
     @app.get("/api/stats")
     async def api_stats(request: Request) -> JSONResponse:
         db: Database = request.app.state.db
