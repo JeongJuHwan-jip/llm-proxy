@@ -213,6 +213,10 @@
 - **test_invalid_json** — JSON 아니면 None.
 - **test_no_data_line** — `event:`만 있으면 None.
 
+### `TestSSEGeneratorMidStreamError` — 업스트림 중간 끊김 시 그레이스풀 종료
+- **test_remote_protocol_error_yields_clean_close** — 첫 청크 후 `httpx.RemoteProtocolError` 발생 시에도 `message_start`/`content_block_start`/`content_block_delta`/`content_block_stop`/`message_delta`/`message_stop` 시퀀스를 모두 방출 (클라이언트 소켓이 비정상 종료되지 않아야 함).
+- **test_read_timeout_yields_clean_close** — 데이터 한 청크도 못 받고 `httpx.ReadTimeout`이 나도 `message_start`/`message_delta`/`message_stop` 닫기 시퀀스는 방출.
+
 ---
 
 ## test_anthropic_e2e.py — Anthropic 어댑터 end-to-end
