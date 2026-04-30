@@ -838,13 +838,71 @@ async def _handle_stream(
     first_resp, first_step = first
 
     async def byte_generator() -> AsyncIterator[bytes]:
+        """SSE-aware passthrough that holds back partial tool_call chunks.
+
+        Once a chunk announces a ``tool_calls`` delta, subsequent chunks are
+        buffered until ``finish_reason`` arrives (then flushed) — so if the
+        upstream cuts mid-tool_call, the partial bytes can be discarded
+        instead of reaching the client (where they would merge with the next
+        endpoint's tool_call by ``index`` and produce malformed JSON like
+        ``{"path":"a.t{"diff":"..."}``).
+
+        Pre-tool_call text content is forwarded live; the buffering window
+        opens only when a tool_call begins.
+        """
+        from .adapters.anthropic import SSEBuffer, _parse_sse_data
+
         completed = False
         current_resp: httpx.Response | None = first_resp
         try:
             while current_resp is not None:
+                sse_buf = SSEBuffer()
+                pending: list[bytes] = []
+                in_tool_call = False
+                finish_seen = False
+
                 try:
                     async for chunk in current_resp.aiter_bytes():
-                        yield chunk
+                        for event_str in sse_buf.feed(chunk):
+                            if not event_str:
+                                continue
+                            raw_event = (event_str + "\n\n").encode("utf-8")
+                            chunk_data = _parse_sse_data(event_str)
+
+                            if chunk_data is None:
+                                # ``[DONE]`` (or unparseable). Flush anything
+                                # held back, then forward.
+                                for p in pending:
+                                    yield p
+                                pending = []
+                                in_tool_call = False
+                                yield raw_event
+                                continue
+
+                            choices = chunk_data.get("choices") or []
+                            has_tool_calls = False
+                            finish_reason = None
+                            if choices:
+                                delta = choices[0].get("delta") or {}
+                                if delta.get("tool_calls"):
+                                    has_tool_calls = True
+                                finish_reason = choices[0].get("finish_reason")
+
+                            if has_tool_calls:
+                                in_tool_call = True
+
+                            if in_tool_call:
+                                pending.append(raw_event)
+                                if finish_reason is not None:
+                                    finish_seen = True
+                                    for p in pending:
+                                        yield p
+                                    pending = []
+                                    in_tool_call = False
+                            else:
+                                yield raw_event
+                                if finish_reason is not None:
+                                    finish_seen = True
                 except asyncio.CancelledError:
                     try:
                         await current_resp.aclose()
@@ -861,7 +919,14 @@ async def _handle_stream(
                         await current_resp.aclose()
                     except Exception:
                         pass
-                    # Mid-stream failover for non-direct mode only.
+                    # Drop the partial tool_call buffer — client never saw it.
+                    pending = []
+                    in_tool_call = False
+                    if finish_seen:
+                        # Logical end already happened; the trailing connection
+                        # drop alone isn't worth a retry.
+                        current_resp = None
+                        break
                     if is_direct:
                         current_resp = None
                         break
@@ -876,6 +941,10 @@ async def _handle_stream(
                         await current_resp.aclose()
                     except Exception:
                         pass
+                    # Flush any leftover pending events (defensive — usually
+                    # empty by this point because [DONE] forces a flush).
+                    for p in pending:
+                        yield p
                     completed = True
                     break
         finally:

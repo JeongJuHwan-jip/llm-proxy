@@ -147,6 +147,7 @@
 - **test_request_log_records_all_attempts** — 요청 로그에 attempts 3개 기록 (alpha=timeout, beta=503, gamma=success).
 - **test_streaming_failover** — 스트리밍 요청도 정상 페일오버, `text/event-stream` 응답.
 - **test_streaming_midcut_falls_over_to_next** — 스트리밍 도중 업스트림이 끊기면(`stream_cut` mock) `byte_generator`가 다음 endpoint로 자동 전환해 끊김 없이 클라이언트에 콘텐츠 전달.
+- **test_streaming_tool_call_cut_does_not_leak_partial** — tool_call 인자 도중 업스트림이 끊겨도 partial JSON이 클라이언트에 노출되지 않고, 회복 endpoint의 완전한 tool_call만 전달됨 (Roo Code 류 클라이언트의 `index` 기반 tool_call 병합 충돌 방지). 클라이언트가 보는 청크들에서 `arguments`를 합쳐 보면 `{"path":"b.txt","diff":"+ok"}`로 정상 파싱.
 - **test_streaming_request_logged** — 스트리밍 요청도 SQLite 로그에 `is_stream=True`로 기록 (회귀 가드: `byte_generator`의 finally 블록이 fire-and-forget로 로그를 누락했던 버그 방지).
 
 ### `TestE2EAllFail`

@@ -188,6 +188,77 @@ class TestE2EFailover:
         finally:
             cut_server.stop()
 
+    def test_streaming_tool_call_cut_does_not_leak_partial(self, mock_servers, tmp_path):
+        """When the first upstream cuts mid-tool_call, the partial tool_call
+        chunks must be discarded (not forwarded to the client). The next
+        endpoint's complete tool_call should reach the client cleanly so a
+        client like Roo Code can parse it as valid JSON.
+
+        Without buffering, a client merging tool_calls by ``index`` would see
+        ``{"path":"a.t`` (from cut endpoint) concatenated with the recovering
+        endpoint's ``{"path":"b.txt","diff":"+ok"}`` and fail to parse.
+        """
+        cut_port = get_free_port()
+        ok_port = get_free_port()
+        cut_server = MockServer(
+            create_mock_upstream(behavior="stream_cut_in_tool_call", name="cutter"),
+            cut_port,
+        )
+        ok_server = MockServer(
+            create_mock_upstream(behavior="tool_call_ok", name="recoverer"),
+            ok_port,
+        )
+        cut_server.start()
+        ok_server.start()
+        try:
+            config = ProxyConfig(
+                proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
+                endpoints=[
+                    EndpointConfig(name="cutter", url=cut_server.url),
+                    EndpointConfig(name="recoverer", url=ok_server.url),
+                ],
+                failover=FailoverConfig(max_retries=3),
+                logging=LoggingConfig(db_path=str(tmp_path / "tool_cut.db")),
+                routing=[
+                    RouteConfig(
+                        name="cut-then-tool-ok",
+                        chain=[
+                            RouteStepConfig(endpoint="cutter", model="mock-model", timeout_ms=5000),
+                            RouteStepConfig(endpoint="recoverer", model="mock-model", timeout_ms=5000),
+                        ],
+                    ),
+                ],
+            )
+            app = create_app(config)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/chat/completions",
+                    json=_chat_body("cut-then-tool-ok", stream=True),
+                )
+
+            assert resp.status_code == 200
+            text = resp.text
+            # ``arguments`` is a JSON-encoded string inside the SSE chunk's
+            # JSON, so its quotes appear escaped on the wire as ``\\"``.
+            assert r'\"path\":\"b.txt\"' in text
+            assert r'\"diff\":\"+ok\"' in text
+            # The cut endpoint's partial JSON must NOT appear (otherwise the
+            # client would see invalid concatenated arguments).
+            assert r'\"path\":\"a.t' not in text
+            # Stream terminator
+            assert "[DONE]" in text
+            # Reconstruct merged tool_call arguments from the chunks the
+            # client would actually see, and confirm they parse as valid JSON
+            # (i.e., the partial chunks did not leak in).
+            import re, json as _json
+            args_pieces = re.findall(r'"arguments":\s*"((?:[^"\\]|\\.)*)"', text)
+            merged = "".join(_json.loads(f'"{p}"') for p in args_pieces)
+            parsed = _json.loads(merged)
+            assert parsed == {"path": "b.txt", "diff": "+ok"}
+        finally:
+            cut_server.stop()
+            ok_server.stop()
+
     def test_streaming_request_logged(self, proxy_config):
         """Streaming requests must also be persisted to the request log
         (regression guard: byte_generator's finally block previously fire-and-

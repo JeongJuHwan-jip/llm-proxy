@@ -107,8 +107,45 @@ def create_mock_upstream(
 
         if is_stream:
             cut_midstream = behavior == "stream_cut"
+            cut_in_tool_call = behavior == "stream_cut_in_tool_call"
+            tool_call_ok = behavior == "tool_call_ok"
+
+            def _tc_chunk(delta: dict, finish_reason: str | None = None) -> str:
+                payload = {
+                    "id": f"chatcmpl-{name}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": model,
+                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+                }
+                return f"data: {json.dumps(payload)}\n\n"
 
             async def stream_chunks() -> AsyncIterator[str]:
+                if cut_in_tool_call:
+                    # Start a tool_call, then cut mid-arguments — the client
+                    # would otherwise receive a partial tool_call.
+                    yield _tc_chunk({"tool_calls": [{
+                        "index": 0, "id": "call_x",
+                        "function": {"name": "apply_diff", "arguments": ""},
+                    }]})
+                    yield _tc_chunk({"tool_calls": [{
+                        "index": 0, "function": {"arguments": '{"path":"a.t'},
+                    }]})
+                    raise RuntimeError(f"simulated tool_call mid-stream cut on {name}")
+
+                if tool_call_ok:
+                    yield _tc_chunk({"tool_calls": [{
+                        "index": 0, "id": "call_y",
+                        "function": {"name": "apply_diff", "arguments": ""},
+                    }]})
+                    yield _tc_chunk({"tool_calls": [{
+                        "index": 0,
+                        "function": {"arguments": '{"path":"b.txt","diff":"+ok"}'},
+                    }]})
+                    yield _tc_chunk({}, finish_reason="tool_calls")
+                    yield "data: [DONE]\n\n"
+                    return
+
                 chunk = {
                     "id": f"chatcmpl-{name}",
                     "object": "chat.completion.chunk",
