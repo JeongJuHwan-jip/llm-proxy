@@ -146,6 +146,7 @@
 - **test_failover_timeout_then_503_then_success** — 200 응답을 받고, gamma가 응답 주체.
 - **test_request_log_records_all_attempts** — 요청 로그에 attempts 3개 기록 (alpha=timeout, beta=503, gamma=success).
 - **test_streaming_failover** — 스트리밍 요청도 정상 페일오버, `text/event-stream` 응답.
+- **test_streaming_midcut_falls_over_to_next** — 스트리밍 도중 업스트림이 끊기면(`stream_cut` mock) `byte_generator`가 다음 endpoint로 자동 전환해 끊김 없이 클라이언트에 콘텐츠 전달.
 - **test_streaming_request_logged** — 스트리밍 요청도 SQLite 로그에 `is_stream=True`로 기록 (회귀 가드: `byte_generator`의 finally 블록이 fire-and-forget로 로그를 누락했던 버그 방지).
 
 ### `TestE2EAllFail`
@@ -217,6 +218,11 @@
 - **test_remote_protocol_error_yields_clean_close** — 첫 청크 후 `httpx.RemoteProtocolError` 발생 시에도 `message_start`/`content_block_start`/`content_block_delta`/`content_block_stop`/`message_delta`/`message_stop` 시퀀스를 모두 방출 (클라이언트 소켓이 비정상 종료되지 않아야 함).
 - **test_read_timeout_yields_clean_close** — 데이터 한 청크도 못 받고 `httpx.ReadTimeout`이 나도 `message_start`/`message_delta`/`message_stop` 닫기 시퀀스는 방출.
 
+### `TestSSEGeneratorFailover` — 스트리밍 도중 끊기면 다음 endpoint로 페일오버
+- **test_continues_on_next_upstream_after_cut** — 첫 업스트림이 도중에 끊기면 factory가 다음 업스트림을 내주고 콘텐츠가 이어짐. `message_start`/`message_stop`은 정확히 1번씩.
+- **test_no_retry_when_finish_reason_received** — `finish_reason`을 받은 뒤의 trailing 끊김은 재시도하지 않고 그대로 종료 (두 번째 업스트림은 건드리지 않음).
+- **test_clean_close_when_all_upstreams_exhausted** — 모든 업스트림이 도중에 끊겨도 정상적인 닫기 시퀀스 방출.
+
 ---
 
 ## test_anthropic_e2e.py — Anthropic 어댑터 end-to-end
@@ -250,6 +256,7 @@
 - **test_streaming_message_start_has_model** — `message_start` data에 `model`(원본 모델명), `role:"assistant"` 포함.
 - **test_streaming_failover** — 스트리밍에서도 페일오버 동작 (gamma 응답).
 - **test_streaming_direct_to_healthy** — 직접 지정 스트리밍 동작.
+- **test_streaming_midcut_falls_over_to_next** — 스트리밍 도중 업스트림이 끊기면(`stream_cut` mock) Anthropic 어댑터가 다음 endpoint로 전환, `message_start`/`message_stop`은 정확히 1번씩, 회복 endpoint(gamma) 콘텐츠가 포함됨.
 - **test_streaming_all_fail_returns_error** — 스트리밍 중 모든 step 실패 → 502 + Anthropic error JSON.
 
 ### `TestOpenAIRegressionFromAnthropicTests` — OpenAI 회귀 검증

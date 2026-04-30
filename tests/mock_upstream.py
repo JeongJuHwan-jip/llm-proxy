@@ -106,6 +106,8 @@ def create_mock_upstream(
         }
 
         if is_stream:
+            cut_midstream = behavior == "stream_cut"
+
             async def stream_chunks() -> AsyncIterator[str]:
                 chunk = {
                     "id": f"chatcmpl-{name}",
@@ -115,6 +117,11 @@ def create_mock_upstream(
                     "choices": [{"index": 0, "delta": {"content": content_text}, "finish_reason": None}],
                 }
                 yield f"data: {json.dumps(chunk)}\n\n"
+                if cut_midstream:
+                    # Drop the connection without sending the final chunk
+                    # or [DONE]; raise so uvicorn aborts the response stream
+                    # ungracefully (mimics RemoteProtocolError on the client).
+                    raise RuntimeError(f"simulated mid-stream cut on {name}")
                 done = {
                     "id": f"chatcmpl-{name}",
                     "object": "chat.completion.chunk",

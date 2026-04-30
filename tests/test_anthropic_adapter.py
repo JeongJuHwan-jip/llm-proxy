@@ -17,6 +17,7 @@ from llm_proxy.adapters.anthropic import (
     SSEBuffer,
     _parse_sse_data,
     anthropic_sse_generator,
+    anthropic_sse_generator_failover,
     translate_request,
     translate_response,
 )
@@ -568,12 +569,16 @@ class _FakeUpstream:
     def __init__(self, chunks: list[bytes], exc: Exception | None) -> None:
         self._chunks = chunks
         self._exc = exc
+        self.closed = False
 
     async def aiter_bytes(self):
         for c in self._chunks:
             yield c
         if self._exc is not None:
             raise self._exc
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class TestSSEGeneratorMidStreamError:
@@ -618,3 +623,110 @@ class TestSSEGeneratorMidStreamError:
         assert "event: message_start" in joined
         assert "event: message_delta" in joined
         assert "event: message_stop" in joined
+
+
+class TestSSEGeneratorFailover:
+    """Mid-stream failover: when the current upstream cuts mid-SSE, the
+    generator should pull the next upstream from the factory and continue
+    streaming, without emitting a second ``message_start``."""
+
+    @pytest.mark.asyncio
+    async def test_continues_on_next_upstream_after_cut(self):
+        first = _FakeUpstream(
+            chunks=[
+                b'data: {"choices":[{"index":0,"delta":{"content":"Par"}}]}\n\n',
+            ],
+            exc=httpx.RemoteProtocolError("peer closed connection"),
+        )
+        second = _FakeUpstream(
+            chunks=[
+                b'data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}\n\n',
+                b'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+            exc=None,
+        )
+
+        ups = [first, second]
+
+        async def factory():
+            if not ups:
+                return None
+            u = ups.pop(0)
+            return u, "ep"
+
+        events: list[str] = []
+        async for ev in anthropic_sse_generator_failover(factory, "claude-3-sonnet"):
+            events.append(ev)
+
+        joined = "".join(events)
+        # message_start emitted exactly once
+        assert joined.count("event: message_start") == 1
+        # message_stop emitted exactly once at the very end
+        assert joined.count("event: message_stop") == 1
+        # both upstreams' text content reached the client (possibly under
+        # different content_block indices)
+        assert '"text": "Par"' in joined
+        assert '"text": "Hello"' in joined
+        # both upstream responses were closed
+        assert first.closed and second.closed
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_finish_reason_received(self):
+        """If the upstream already reported finish_reason before the cut,
+        we should not retry on the next endpoint."""
+        first = _FakeUpstream(
+            chunks=[
+                b'data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}\n\n',
+            ],
+            exc=httpx.RemoteProtocolError("trailing connection drop"),
+        )
+        second = _FakeUpstream(
+            chunks=[b'data: {"choices":[{"delta":{"content":"unwanted"}}]}\n\n'],
+            exc=None,
+        )
+        ups = [first, second]
+
+        async def factory():
+            if not ups:
+                return None
+            u = ups.pop(0)
+            return u, "ep"
+
+        events: list[str] = []
+        async for ev in anthropic_sse_generator_failover(factory, "m"):
+            events.append(ev)
+
+        joined = "".join(events)
+        assert '"text": "done"' in joined
+        assert '"text": "unwanted"' not in joined
+        # second upstream was never touched
+        assert second.closed is False
+
+    @pytest.mark.asyncio
+    async def test_clean_close_when_all_upstreams_exhausted(self):
+        """If every upstream cuts mid-stream, still emit a clean close."""
+        first = _FakeUpstream(
+            chunks=[b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n'],
+            exc=httpx.RemoteProtocolError("cut1"),
+        )
+        second = _FakeUpstream(
+            chunks=[b'data: {"choices":[{"delta":{"content":"b"}}]}\n\n'],
+            exc=httpx.RemoteProtocolError("cut2"),
+        )
+        ups = [first, second]
+
+        async def factory():
+            if not ups:
+                return None
+            u = ups.pop(0)
+            return u, "ep"
+
+        events: list[str] = []
+        async for ev in anthropic_sse_generator_failover(factory, "m"):
+            events.append(ev)
+
+        joined = "".join(events)
+        assert joined.count("event: message_start") == 1
+        assert joined.count("event: message_stop") == 1
+        assert "event: message_delta" in joined
