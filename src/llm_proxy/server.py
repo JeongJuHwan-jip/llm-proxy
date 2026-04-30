@@ -144,10 +144,14 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             try:
                 sdata = load_settings_file(settings_path)
                 router.reload_routing(sdata.routes)
+                router.set_model_settings(sdata.model_settings)
                 if sdata.failover is not None:
                     cfg.failover = sdata.failover
                     logger.info("Loaded failover settings from %s", settings_path)
-                logger.info("Loaded settings from %s (%d routes)", settings_path, len(sdata.routes))
+                logger.info(
+                    "Loaded settings from %s (%d routes, %d model setting(s))",
+                    settings_path, len(sdata.routes), len(sdata.model_settings),
+                )
             except Exception as exc:
                 logger.warning("Could not load %s: %s — using defaults", settings_path, exc)
         # ------------------------------------------------------------
@@ -340,18 +344,15 @@ def _register_routes(app: FastAPI) -> None:
 
     # --------------------------------------------------------- config helpers
 
-    def _save_settings(app_instance: FastAPI, route_configs=None) -> None:
-        """Save current failover + routing to settings.json."""
+    def _save_settings(
+        app_instance: FastAPI,
+        route_configs=None,
+        model_settings=None,  # list[ModelSettingConfig] | None
+    ) -> None:
+        """Save current failover + routing + model settings to settings.json."""
         cfg_: ProxyConfig = app_instance.state.config
         router_: Router = app_instance.state.router
         spath: Path = app_instance.state.settings_path
-
-        def _step_dict(endpoint: str, model: str, timeout_ms: int,
-                       max_context_tokens: int | None) -> dict:
-            d: dict = {"endpoint": endpoint, "model": model, "timeout_ms": timeout_ms}
-            if max_context_tokens is not None:
-                d["max_context_tokens"] = max_context_tokens
-            return d
 
         if route_configs is None:
             routed = router_.get_routed_models()
@@ -359,7 +360,8 @@ def _register_routes(app: FastAPI) -> None:
                 {
                     "name": rname,
                     "chain": [
-                        _step_dict(s["server"], s["model"], s["timeout_ms"], s["max_context_tokens"])
+                        {"endpoint": s["server"], "model": s["model"],
+                         "timeout_ms": s["timeout_ms"]}
                         for s in chain
                     ],
                 }
@@ -370,11 +372,22 @@ def _register_routes(app: FastAPI) -> None:
                 {
                     "name": rc.name,
                     "chain": [
-                        _step_dict(s.endpoint, s.model, s.timeout_ms, s.max_context_tokens)
+                        {"endpoint": s.endpoint, "model": s.model,
+                         "timeout_ms": s.timeout_ms}
                         for s in rc.chain
                     ],
                 }
                 for rc in route_configs
+            ]
+
+        if model_settings is None:
+            model_settings_out = router_.get_model_settings()
+        else:
+            model_settings_out = [
+                {"endpoint": ms.endpoint, "model": ms.model,
+                 "max_context_tokens": ms.max_context_tokens}
+                for ms in model_settings
+                if ms.max_context_tokens is not None
             ]
 
         data = {
@@ -385,6 +398,7 @@ def _register_routes(app: FastAPI) -> None:
                 "routing_strategy": cfg_.failover.routing_strategy,
             },
             "routes": routes_out,
+            "model_settings": model_settings_out,
         }
 
         with open(spath, "w", encoding="utf-8") as f:
@@ -404,6 +418,7 @@ def _register_routes(app: FastAPI) -> None:
         spath: Path = request.app.state.settings_path
 
         routes: list[dict] = []
+        model_settings: list[dict] = []
         if spath.exists():
             try:
                 sdata = load_settings_file(spath)
@@ -415,12 +430,19 @@ def _register_routes(app: FastAPI) -> None:
                                 "endpoint": s.endpoint,
                                 "model": s.model,
                                 "timeout_ms": s.timeout_ms,
-                                "max_context_tokens": s.max_context_tokens,
                             }
                             for s in r.chain
                         ],
                     }
                     for r in sdata.routes
+                ]
+                model_settings = [
+                    {
+                        "endpoint": ms.endpoint,
+                        "model": ms.model,
+                        "max_context_tokens": ms.max_context_tokens,
+                    }
+                    for ms in sdata.model_settings
                 ]
             except Exception:
                 pass  # corrupted file → show empty
@@ -433,6 +455,7 @@ def _register_routes(app: FastAPI) -> None:
                 "routing_strategy": cfg.failover.routing_strategy,
             },
             "routes": routes,
+            "model_settings": model_settings,
         })
 
     @app.put("/api/config/settings")
@@ -473,14 +496,33 @@ def _register_routes(app: FastAPI) -> None:
         if not isinstance(routes_raw, list):
             errors.append("'routes' must be a list")
 
+        # ── Validate model settings ──
+        model_settings_raw = data.get("model_settings", [])
+        if not isinstance(model_settings_raw, list):
+            errors.append("'model_settings' must be a list")
+
         if errors:
             return JSONResponse({"errors": errors}, status_code=422)
 
-        from .config import RouteConfig
+        from .config import ModelSettingConfig, RouteConfig
         try:
             route_configs = [RouteConfig.model_validate(r) for r in routes_raw]
         except Exception as exc:
             return JSONResponse({"error": f"Validation error: {exc}"}, status_code=422)
+
+        try:
+            # Drop entries that have no real limit so empty inputs from the
+            # dashboard ({endpoint, model, max_context_tokens: null}) don't
+            # produce noisy validation churn.
+            model_setting_configs = [
+                ModelSettingConfig.model_validate(ms)
+                for ms in model_settings_raw
+                if ms.get("max_context_tokens") not in (None, "", 0)
+            ]
+        except Exception as exc:
+            return JSONResponse(
+                {"error": f"model_settings validation error: {exc}"}, status_code=422,
+            )
 
         # ── Apply failover in memory ──
         if "max_retries" in fo:
@@ -493,15 +535,20 @@ def _register_routes(app: FastAPI) -> None:
             cfg.failover.routing_strategy = fo["routing_strategy"]
 
         # ── Save to settings.json ──
-        _save_settings(request.app, route_configs=route_configs)
+        _save_settings(
+            request.app, route_configs=route_configs,
+            model_settings=model_setting_configs,
+        )
 
-        # ── Reload routing ──
+        # ── Reload routing + model settings ──
         router.reload_routing(route_configs)
+        router.set_model_settings(model_setting_configs)
         routed = router.get_routed_models()
 
         logger.info(
-            "Settings updated via dashboard — failover + %d route(s), saved to %s",
-            len(route_configs), request.app.state.settings_path,
+            "Settings updated via dashboard — failover + %d route(s) + %d model setting(s), saved to %s",
+            len(route_configs), len(model_setting_configs),
+            request.app.state.settings_path,
         )
         events.publish()
 
@@ -509,6 +556,7 @@ def _register_routes(app: FastAPI) -> None:
             "status": "updated",
             "settings_file": str(request.app.state.settings_path),
             "routes": list(routed.keys()),
+            "model_settings": len(model_setting_configs),
         })
 
     # ---------------------------------------------------------------- SSE

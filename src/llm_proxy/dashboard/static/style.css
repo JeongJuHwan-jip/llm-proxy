@@ -422,3 +422,16 @@ tbody tr:hover { background: #fafafa; }
   border-radius: 2px;
   margin: -1px 8px;
 }
+
+/* Per-(endpoint, model) settings table */
+#model-settings-table { width: 100%; border-collapse: collapse; }
+#model-settings-table th,
+#model-settings-table td {
+  padding: 6px 10px; text-align: left;
+  border-bottom: 1px solid #eee;
+  font-size: 0.92em;
+}
+#model-settings-table th { color: #555; font-weight: 600; }
+#model-settings-table input.model-ctx {
+  width: 130px; padding: 3px 6px;
+}

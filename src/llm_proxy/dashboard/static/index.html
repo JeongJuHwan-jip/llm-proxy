@@ -95,6 +95,32 @@
         </div>
       </section>
 
+      <!-- Per-(endpoint, model) settings -->
+      <section class="settings-section">
+        <h2>Models</h2>
+        <p class="hint">
+          Per-model context-window limits. When a request's estimated token count
+          exceeds the limit for a model, route steps using that model are skipped
+          during failover. Empty = unbounded.
+        </p>
+        <div class="settings-card">
+          <div class="table-wrapper">
+            <table id="model-settings-table">
+              <thead>
+                <tr>
+                  <th>Endpoint</th>
+                  <th>Model</th>
+                  <th>Max context tokens</th>
+                </tr>
+              </thead>
+              <tbody id="model-settings-body">
+                <tr><td colspan="3" class="muted">Loading...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <!-- Routing editor -->
       <section class="settings-section">
         <h2>Routing</h2>

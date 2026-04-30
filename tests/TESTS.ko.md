@@ -257,6 +257,8 @@
 
 서로 다른 컨텍스트 윈도우를 가진 모델들이 한 체인에 묶일 때(예: 1M 모델 → 256K 모델), 큰 요청이 작은 모델로 페일오버해 조용히 잘리거나 멈추는 문제를 막기 위한 필터(`Router.filter_by_context`)와 토큰 추정 함수(`estimate_request_tokens`)를 검증한다.
 
+**설계상 핵심:** 컨텍스트 한도는 라우트 step이 아니라 `(endpoint, model)` 쌍에 전역으로 저장된다(`ModelSettingConfig` / `Router.set_model_settings`). 같은 모델이 여러 라우트에 들어가도 한도는 항상 하나다.
+
 ### `TestEstimateRequestTokens` — 토큰 추정(char/4 휴리스틱)
 - **test_empty_body_is_zero** — 빈 본문 → 0.
 - **test_simple_string_message** — 4자 문자열 content → 1 token.
@@ -268,12 +270,13 @@
 - **test_anthropic_top_level_system_string/blocks** — Anthropic 스타일 top-level `system` (str / 블록 배열) 모두 합산.
 - **test_negative_max_tokens_ignored** — 음수 `max_tokens`는 0으로 처리.
 
-### `TestFilterByContext` — `max_context_tokens`로 step 필터
+### `TestFilterByContext` — 모델 단위 한도로 step 필터
 - **test_step_kept_when_fits** — 짧은 요청 → 모든 step 통과.
 - **test_small_step_dropped_when_request_too_big** — 1M 모델은 통과, 256K 모델은 제외.
 - **test_all_steps_dropped_when_too_big_for_everyone** — 모든 step의 한도를 초과하면 빈 리스트(상위 호출자가 502 등으로 처리).
-- **test_step_with_no_limit_always_kept** — `max_context_tokens=None`인 step은 항상 통과(언바운디드 의미).
+- **test_model_with_no_setting_is_unbounded** — 설정이 없는 `(endpoint, model)`은 무제한으로 간주.
 - **test_max_tokens_output_budget_counted** — 입력만으로는 들어가도 `max_tokens`(출력 예약) 합산 시 초과하면 제외.
+- **test_empty_settings_means_no_filtering** — `set_model_settings`를 한 번도 호출하지 않으면 필터링 자체를 하지 않음(라이트 패스).
 
 ### `TestExecuteWithContextFilter` — 페일오버 루프에 필터 적용 통합
 - **test_long_request_skips_small_and_fails_on_big** — big 타임아웃 시 small이 자동 fallback되지 않아야 함(컨텍스트 부족) → `AllEndpointsFailedError` 1회 시도만 기록.
@@ -281,6 +284,11 @@
 - **test_short_request_falls_over_to_small** — 짧은 요청이면 정상적으로 small까지 페일오버.
 - **test_direct_request_skips_context_filter** — `endpoint/model` 직접 요청(`is_direct=True`)은 사용자가 명시했으므로 컨텍스트 필터를 우회.
 
+### `TestSingleSourceOfTruth` — 모델 한도는 단일 출처
+- **test_same_model_in_two_routes_has_one_limit** — 같은 `(endpoint, model)` 쌍이 두 개 라우트에 등장해도 한 번 설정된 한도가 두 라우트 모두에 동일하게 적용.
+
 ### `TestSettingsRoundTrip` — settings.json 라운드트립
-- **test_max_context_tokens_loaded_from_settings_json** — `max_context_tokens` 필드가 chain step에 정상 파싱되며, 미지정 시 `None`.
+- **test_model_settings_loaded_from_settings_json** — `model_settings` 배열이 `ModelSettingConfig` 리스트로 정상 파싱.
 - **test_invalid_max_context_tokens_rejected** — `0` 등 양수가 아닌 값은 검증 실패.
+- **test_chain_step_no_longer_accepts_max_context_tokens** — `RouteStepConfig`에 `max_context_tokens`를 다시 추가하면 회귀(같은 모델에 다른 한도가 부여되는 문제)이므로 속성으로 남지 않음을 가드.
+- **test_router_get_model_settings_reflects_set** — `set_model_settings`로 넣은 값이 `get_model_settings`로 그대로 라운드트립.

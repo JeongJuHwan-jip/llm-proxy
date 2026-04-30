@@ -160,6 +160,12 @@ function updateConn() {
 // Discovery data: { endpoint_models: { ep: [model, ...] } }
 let discoveryData = null;
 
+// Saved per-(endpoint, model) limits, keyed as "ep||model" so we can match
+// against discovered models when rendering the table.
+let savedModelSettings = {};
+
+function _msKey(ep, model) { return `${ep}||${model}`; }
+
 async function loadSettings() {
   try {
     const [settingsRes, discoveryRes] = await Promise.all([
@@ -167,7 +173,7 @@ async function loadSettings() {
       fetch('/api/discovery'),
     ]);
 
-    // Failover + routes
+    // Failover + routes + model settings
     if (settingsRes.ok) {
       const d = await settingsRes.json();
       document.getElementById('fo-max-retries').value = d.failover.max_retries;
@@ -175,14 +181,92 @@ async function loadSettings() {
       document.getElementById('fo-cb-cooldown').value = d.failover.circuit_breaker_cooldown;
       document.getElementById('fo-strategy').value = d.failover.routing_strategy;
       renderRoutes(d.routes || []);
+
+      savedModelSettings = {};
+      for (const ms of d.model_settings || []) {
+        if (ms.max_context_tokens != null) {
+          savedModelSettings[_msKey(ms.endpoint, ms.model)] = ms.max_context_tokens;
+        }
+      }
     }
 
-    // Discovery palette
+    // Discovery palette + Models table both depend on discovery
     if (discoveryRes.ok) {
       discoveryData = await discoveryRes.json();
       renderPalette();
+      renderModelSettings();
     }
   } catch (e) { console.error('settings load:', e); }
+}
+
+// ── Models section (per-(endpoint, model) settings) ────────────────────────
+
+function renderModelSettings() {
+  const tbody = document.getElementById('model-settings-body');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+
+  if (!discoveryData || !discoveryData.endpoint_models) {
+    tbody.innerHTML = '<tr><td colspan="3" class="muted">No discovery data.</td></tr>';
+    return;
+  }
+
+  const epModels = discoveryData.endpoint_models;
+  const rows = [];
+  for (const ep of Object.keys(epModels)) {
+    for (const model of epModels[ep]) {
+      rows.push([ep, model]);
+    }
+  }
+  rows.sort((a, b) => (a[0] + a[1]).localeCompare(b[0] + b[1]));
+
+  // Also surface saved settings for models that are no longer detected,
+  // so the user can clean them up if discovery removed them.
+  const detected = new Set(rows.map(([e, m]) => _msKey(e, m)));
+  for (const key of Object.keys(savedModelSettings)) {
+    if (!detected.has(key)) {
+      const [e, m] = key.split('||');
+      rows.push([e, m]);
+    }
+  }
+
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="3" class="muted">No models detected.</td></tr>';
+    return;
+  }
+
+  for (const [ep, model] of rows) {
+    const key = _msKey(ep, model);
+    const current = savedModelSettings[key];
+    const tr = document.createElement('tr');
+    tr.dataset.endpoint = ep;
+    tr.dataset.model = model;
+    tr.innerHTML = `
+      <td><span class="ep-tag">${escHtml(ep)}</span></td>
+      <td><span class="model-name">${escHtml(model)}</span></td>
+      <td><input type="number" class="model-ctx" min="1" step="1000"
+                 placeholder="∞"
+                 value="${current == null ? '' : current}"
+                 title="Max context tokens (empty = unbounded)" /></td>`;
+    tbody.appendChild(tr);
+  }
+}
+
+function collectModelSettings() {
+  const out = [];
+  document.querySelectorAll('#model-settings-body tr').forEach(tr => {
+    const ep = tr.dataset.endpoint;
+    const model = tr.dataset.model;
+    if (!ep || !model) return;
+    const input = tr.querySelector('.model-ctx');
+    if (!input) return;
+    const raw = input.value.trim();
+    if (raw === '') return;
+    const n = parseInt(raw, 10);
+    if (!Number.isFinite(n) || n <= 0) return;
+    out.push({ endpoint: ep, model, max_context_tokens: n });
+  });
+  return out;
 }
 
 // ── Palette (model blocks source) ──────────────────────────────────────────
@@ -248,15 +332,14 @@ function createRouteCard(route) {
     const ep = step.server || step.endpoint || '';
     const model = step.model || '';
     const timeout = step.timeout_ms || 10000;
-    const ctx = step.max_context_tokens == null ? '' : step.max_context_tokens;
-    chain.appendChild(createChainItem(ep, model, i + 1, timeout, ctx));
+    chain.appendChild(createChainItem(ep, model, i + 1, timeout));
   });
   renumberChain(chain);
 
   return card;
 }
 
-function createChainItem(endpoint, model, order, timeoutMs, maxContextTokens) {
+function createChainItem(endpoint, model, order, timeoutMs) {
   const tms = timeoutMs || 10000;
   const timeoutInput = mk('input', {
     className: 'chain-timeout', type: 'number', min: '100', step: '500',
@@ -266,29 +349,16 @@ function createChainItem(endpoint, model, order, timeoutMs, maxContextTokens) {
   timeoutInput.style.marginLeft = '6px';
   timeoutInput.style.fontSize = '0.85em';
 
-  const ctxVal = (maxContextTokens === '' || maxContextTokens == null) ? '' : String(maxContextTokens);
-  const ctxInput = mk('input', {
-    className: 'chain-ctx', type: 'number', min: '1', step: '1000',
-    value: ctxVal, placeholder: '∞',
-    title: 'Max context tokens (empty = unbounded). Steps that cannot fit the request are skipped during failover.',
-  });
-  ctxInput.style.width = '90px';
-  ctxInput.style.marginLeft = '6px';
-  ctxInput.style.fontSize = '0.85em';
-
   const item = mk('div', { className: 'chain-item', draggable: 'true' },
     mk('span', { className: 'chain-order', textContent: String(order || '') }),
     mk('span', { className: 'ep-tag', textContent: endpoint }),
     mk('span', { className: 'model-name', textContent: model }),
     timeoutInput,
     mk('span', { className: 'timeout-unit', textContent: 'ms' }),
-    ctxInput,
-    mk('span', { className: 'timeout-unit', textContent: 'ctx' }),
   );
   item.dataset.endpoint = endpoint;
   item.dataset.model = model;
   item.dataset.timeoutMs = String(tms);
-  item.dataset.maxContextTokens = ctxVal;
 
   const removeBtn = mk('button', { className: 'chain-remove', textContent: '\u00D7', title: 'Remove from chain' });
   removeBtn.addEventListener('click', () => {
@@ -330,15 +400,7 @@ function onChainDragStart(e) {
   dragOrigin = 'chain';
   const tInput = dragSource.querySelector('.chain-timeout');
   const tms = tInput ? parseInt(tInput.value, 10) || 10000 : 10000;
-  const cInput = dragSource.querySelector('.chain-ctx');
-  const ctxRaw = cInput ? cInput.value.trim() : '';
-  const ctx = ctxRaw === '' ? '' : (parseInt(ctxRaw, 10) || '');
-  dragData = {
-    endpoint: dragSource.dataset.endpoint,
-    model: dragSource.dataset.model,
-    timeoutMs: tms,
-    maxContextTokens: ctx,
-  };
+  dragData = { endpoint: dragSource.dataset.endpoint, model: dragSource.dataset.model, timeoutMs: tms };
   dragSource.classList.add('dragging');
   e.dataTransfer.effectAllowed = 'move';
   e.dataTransfer.setData('text/plain', `${dragData.endpoint}/${dragData.model}`);
@@ -387,10 +449,7 @@ function setupDropZone(chain) {
       dragSource.remove();
     }
 
-    const newItem = createChainItem(
-      dragData.endpoint, dragData.model, 0,
-      dragData.timeoutMs, dragData.maxContextTokens,
-    );
+    const newItem = createChainItem(dragData.endpoint, dragData.model, 0, dragData.timeoutMs);
     const items = [...chain.querySelectorAll('.chain-item')];
     if (insertIdx >= items.length) {
       chain.appendChild(newItem);
@@ -437,14 +496,7 @@ function collectRoutingData() {
       const mdl = item.dataset.model;
       const tInput = item.querySelector('.chain-timeout');
       const tms = tInput ? parseInt(tInput.value, 10) || 10000 : 10000;
-      const cInput = item.querySelector('.chain-ctx');
-      const ctxRaw = cInput ? cInput.value.trim() : '';
-      const step = { endpoint: ep, model: mdl, timeout_ms: tms };
-      if (ctxRaw !== '') {
-        const n = parseInt(ctxRaw, 10);
-        if (n > 0) step.max_context_tokens = n;
-      }
-      if (ep && mdl) chain.push(step);
+      if (ep && mdl) chain.push({ endpoint: ep, model: mdl, timeout_ms: tms });
     });
     if (chain.length) routes.push({ name, chain });
   });
@@ -484,6 +536,7 @@ function initSettingsControls() {
         routing_strategy:          document.getElementById('fo-strategy').value,
       },
       routes: collectRoutingData(),
+      model_settings: collectModelSettings(),
     };
 
     try {

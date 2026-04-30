@@ -81,23 +81,36 @@ class AuthConfig(BaseModel):
 class RouteStepConfig(BaseModel):
     """One step in a route chain: which endpoint to use and which model to request.
 
-    ``endpoint``           — must match a name in the top-level ``endpoints:`` list.
-    ``model``              — model name sent to that endpoint for this step.
-    ``timeout_ms``         — per-step request timeout in milliseconds (default 10 000).
-    ``max_context_tokens`` — optional context-window budget for this (endpoint, model)
-                             pair. Steps whose budget is smaller than the estimated
-                             request size are skipped during failover so a smaller
-                             fallback model never silently truncates / stalls on an
-                             over-long prompt. ``None`` means unbounded.
+    ``endpoint``   — must match a name in the top-level ``endpoints:`` list.
+    ``model``      — model name sent to that endpoint for this step.
+    ``timeout_ms`` — per-step request timeout in milliseconds (default 10 000).
 
     The same endpoint can appear multiple times in a chain with different models:
       e1/m1 → e2/m2 → e1/m2 → e2/m3 → …
     All steps referencing the same endpoint share its circuit-breaker state.
+
+    Context-window budgets are NOT specified here — they are a property of the
+    (endpoint, model) pair, configured once via ``ModelSettingConfig`` so the
+    same model can't be assigned different limits in different routes.
     """
 
     endpoint: str   # references EndpointConfig.name
     model: str
     timeout_ms: int = Field(default=10000, gt=0)
+
+
+class ModelSettingConfig(BaseModel):
+    """Per-(endpoint, model) tuning.
+
+    Currently only ``max_context_tokens`` lives here, but this is the natural
+    place to add other per-model knobs in the future. Identified by the
+    (endpoint, model) pair so a model exposed by multiple endpoints can have
+    its own setting per endpoint if needed (e.g. a self-hosted vs. provider
+    deployment of the same model with different effective windows).
+    """
+
+    endpoint: str
+    model: str
     max_context_tokens: int | None = Field(default=None, gt=0)
 
 
@@ -192,22 +205,24 @@ def resolve_api_keys(keys: list[str]) -> list[str]:
 
 
 class SettingsFileData:
-    """Parsed content of settings.json (failover + routes)."""
+    """Parsed content of settings.json (failover + routes + model settings)."""
 
     def __init__(
         self,
         routes: list[RouteConfig],
         failover: FailoverConfig | None = None,
+        model_settings: list[ModelSettingConfig] | None = None,
     ) -> None:
         self.routes = routes
         self.failover = failover
+        self.model_settings = model_settings or []
 
 
 def load_settings_file(path: str | Path) -> SettingsFileData:
-    """Load settings.json containing failover config and routes.
+    """Load settings.json containing failover config, routes, and model settings.
 
-    Returns ``SettingsFileData`` with routes and optionally failover.
-    Returns empty data if the file does not exist.
+    Returns ``SettingsFileData`` with routes and optionally failover / model
+    settings. Returns empty data if the file does not exist.
     """
     path = Path(path)
     if not path.exists():
@@ -225,7 +240,19 @@ def load_settings_file(path: str | Path) -> SettingsFileData:
     if not isinstance(routes_raw, list):
         raise ValueError(f"'routes' must be a list in {path}")
     routes = [RouteConfig.model_validate(item) for item in routes_raw]
-    return SettingsFileData(routes=routes, failover=failover)
+
+    model_settings_raw = raw.get("model_settings", [])
+    if not isinstance(model_settings_raw, list):
+        raise ValueError(f"'model_settings' must be a list in {path}")
+    model_settings = [
+        ModelSettingConfig.model_validate(item) for item in model_settings_raw
+    ]
+
+    return SettingsFileData(
+        routes=routes,
+        failover=failover,
+        model_settings=model_settings,
+    )
 
 
 def resolve_settings_path(config_path: Path) -> Path:

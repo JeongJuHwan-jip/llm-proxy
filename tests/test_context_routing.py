@@ -1,9 +1,12 @@
 """Tests for context-window-aware routing.
 
-Verifies that named-route steps declare a ``max_context_tokens`` budget and
-that the router filters out steps whose budget cannot fit the estimated
-request, so a smaller fallback model never silently truncates / stalls on an
-over-long prompt.
+Verifies that per-(endpoint, model) ``max_context_tokens`` settings filter out
+route steps whose model can't fit the estimated request, so a smaller fallback
+model never silently truncates / stalls on an over-long prompt.
+
+Limits are configured once globally (``ModelSettingConfig`` /
+``Router.set_model_settings``) — never on individual route steps — so the same
+model can never end up with two different limits in two different routes.
 """
 
 from __future__ import annotations
@@ -17,6 +20,7 @@ from llm_proxy.config import (
     EndpointConfig,
     FailoverConfig,
     LoggingConfig,
+    ModelSettingConfig,
     ProxyConfig,
     ProxyServerConfig,
     RouteConfig,
@@ -108,12 +112,11 @@ class TestEstimateRequestTokens:
 
 
 # ---------------------------------------------------------------------------
-# Router.filter_by_context
+# Helpers — two-tier setup with a 1M and a 256K model
 # ---------------------------------------------------------------------------
 
 
 def _two_tier_config() -> ProxyConfig:
-    """Big-model (1M) and small-model (256K) on two endpoints."""
     return ProxyConfig(
         proxy=ProxyServerConfig(host="127.0.0.1", port=8000),
         endpoints=[
@@ -131,31 +134,40 @@ def _two_tier_config() -> ProxyConfig:
             RouteConfig(
                 name="ctx-route",
                 chain=[
-                    RouteStepConfig(
-                        endpoint="big", model="big-1m",
-                        max_context_tokens=1_000_000,
-                    ),
-                    RouteStepConfig(
-                        endpoint="small", model="small-256k",
-                        max_context_tokens=256_000,
-                    ),
+                    RouteStepConfig(endpoint="big", model="big-1m"),
+                    RouteStepConfig(endpoint="small", model="small-256k"),
                 ],
             ),
         ],
     )
 
 
+def _two_tier_router() -> Router:
+    """Router with the standard 1M / 256K model limits applied globally."""
+    router = Router(_two_tier_config())
+    router.set_model_settings([
+        ModelSettingConfig(endpoint="big", model="big-1m", max_context_tokens=1_000_000),
+        ModelSettingConfig(endpoint="small", model="small-256k", max_context_tokens=256_000),
+    ])
+    return router
+
+
+# ---------------------------------------------------------------------------
+# Router.filter_by_context
+# ---------------------------------------------------------------------------
+
+
 class TestFilterByContext:
 
     def test_step_kept_when_fits(self):
-        router = Router(_two_tier_config())
+        router = _two_tier_router()
         steps = router.get_route("ctx-route")
         body = {"messages": [{"role": "user", "content": "hi"}]}
         eligible = router.filter_by_context(steps, body)
         assert [s.endpoint.name for s in eligible] == ["big", "small"]
 
     def test_small_step_dropped_when_request_too_big(self):
-        router = Router(_two_tier_config())
+        router = _two_tier_router()
         steps = router.get_route("ctx-route")
         # ~300K tokens (1.2M chars / 4) → fits in 1M big, exceeds 256K small
         body = {"messages": [{"role": "user", "content": "x" * 1_200_000}]}
@@ -163,27 +175,32 @@ class TestFilterByContext:
         assert [s.endpoint.name for s in eligible] == ["big"]
 
     def test_all_steps_dropped_when_too_big_for_everyone(self):
-        router = Router(_two_tier_config())
+        router = _two_tier_router()
         steps = router.get_route("ctx-route")
         # ~5M tokens — exceeds both
         body = {"messages": [{"role": "user", "content": "x" * 20_000_000}]}
         eligible = router.filter_by_context(steps, body)
         assert eligible == []
 
-    def test_step_with_no_limit_always_kept(self):
-        """A step with max_context_tokens=None is treated as unbounded."""
-        cfg = _two_tier_config()
-        cfg.routing[0].chain[1].max_context_tokens = None  # small now unbounded
-        router = Router(cfg)
+    def test_model_with_no_setting_is_unbounded(self):
+        """A (endpoint, model) pair without an entry is treated as unbounded."""
+        router = _two_tier_router()
+        # Drop the small model's limit by re-applying without it
+        router.set_model_settings([
+            ModelSettingConfig(
+                endpoint="big", model="big-1m", max_context_tokens=1_000_000,
+            ),
+        ])
         steps = router.get_route("ctx-route")
         body = {"messages": [{"role": "user", "content": "x" * 20_000_000}]}
         eligible = router.filter_by_context(steps, body)
+        # big is over its limit, small is now unbounded
         assert [s.endpoint.name for s in eligible] == ["small"]
 
     def test_max_tokens_output_budget_counted(self):
         """A request that fits inputs but blows the budget once max_tokens is
         added should be skipped."""
-        router = Router(_two_tier_config())
+        router = _two_tier_router()
         steps = router.get_route("ctx-route")
         # Inputs ~ 200K tokens; max_tokens=100K → total 300K, exceeds 256K small
         body = {
@@ -192,6 +209,14 @@ class TestFilterByContext:
         }
         eligible = router.filter_by_context(steps, body)
         assert [s.endpoint.name for s in eligible] == ["big"]
+
+    def test_empty_settings_means_no_filtering(self):
+        """Without any model settings, no step is filtered regardless of size."""
+        router = Router(_two_tier_config())  # no set_model_settings called
+        steps = router.get_route("ctx-route")
+        body = {"messages": [{"role": "user", "content": "x" * 20_000_000}]}
+        eligible = router.filter_by_context(steps, body)
+        assert [s.endpoint.name for s in eligible] == ["big", "small"]
 
 
 # ---------------------------------------------------------------------------
@@ -211,7 +236,7 @@ class TestExecuteWithContextFilter:
         """Big endpoint times out, small would normally take over but its
         context window is too small → AllEndpointsFailedError instead of a
         silent stall on a truncated prompt."""
-        router = Router(_two_tier_config())
+        router = _two_tier_router()
 
         async def post(url, **kw):
             if "big" in url:
@@ -233,7 +258,7 @@ class TestExecuteWithContextFilter:
         assert attempts[0].endpoint_name == "big"
 
     async def test_long_request_succeeds_on_big_when_big_works(self):
-        router = Router(_two_tier_config())
+        router = _two_tier_router()
         ok = MagicMock(status_code=200)
 
         async def post(url, **kw):
@@ -252,7 +277,7 @@ class TestExecuteWithContextFilter:
 
     async def test_short_request_falls_over_to_small(self):
         """For a small request both steps are eligible — failover still works."""
-        router = Router(_two_tier_config())
+        router = _two_tier_router()
 
         async def post(url, **kw):
             if "big" in url:
@@ -273,12 +298,11 @@ class TestExecuteWithContextFilter:
     async def test_direct_request_skips_context_filter(self):
         """Direct endpoint/model requests bypass routing logic entirely —
         including the context filter — so the user's explicit choice is honored."""
-        router = Router(_two_tier_config())
+        router = _two_tier_router()
         small = router.get_endpoint_by_name("small")
         client = _mock_client(AsyncMock(return_value=MagicMock(status_code=200)))
 
-        # Use a manually built RouteStep so we can pretend small has a hard limit
-        step = RouteStep(small, "small-256k", 10000, max_context_tokens=256_000)
+        step = RouteStep(small, "small-256k", 10000)
         body = {"messages": [{"role": "user", "content": "x" * 2_000_000}]}
 
         # is_direct=True → context filter skipped, request goes through
@@ -290,30 +314,58 @@ class TestExecuteWithContextFilter:
 
 
 # ---------------------------------------------------------------------------
+# Single source of truth — same model in two routes shares one limit
+# ---------------------------------------------------------------------------
+
+
+class TestSingleSourceOfTruth:
+    """The whole point of the refactor: per-model settings live globally,
+    so the same (endpoint, model) pair has the same context limit no matter
+    which route uses it."""
+
+    def test_same_model_in_two_routes_has_one_limit(self):
+        cfg = _two_tier_config()
+        cfg.routing.append(RouteConfig(
+            name="other-route",
+            chain=[RouteStepConfig(endpoint="small", model="small-256k")],
+        ))
+        router = Router(cfg)
+        router.set_model_settings([
+            ModelSettingConfig(
+                endpoint="small", model="small-256k", max_context_tokens=256_000,
+            ),
+        ])
+
+        # A long request hits the global limit on both routes equally.
+        body = {"messages": [{"role": "user", "content": "x" * 2_000_000}]}
+        for route_name in ("ctx-route", "other-route"):
+            eligible = router.filter_by_context(router.get_route(route_name), body)
+            assert all(s.endpoint.name != "small" for s in eligible), route_name
+
+
+# ---------------------------------------------------------------------------
 # Settings.json round-trip
 # ---------------------------------------------------------------------------
 
 
 class TestSettingsRoundTrip:
 
-    def test_max_context_tokens_loaded_from_settings_json(self, tmp_path):
+    def test_model_settings_loaded_from_settings_json(self, tmp_path):
         from llm_proxy.config import load_settings_file
         import json
 
         spath = tmp_path / "settings.json"
         spath.write_text(json.dumps({
-            "routes": [{
-                "name": "r",
-                "chain": [
-                    {"endpoint": "a", "model": "m1", "max_context_tokens": 1_000_000},
-                    {"endpoint": "b", "model": "m2"},  # no field → None
-                ],
-            }],
+            "routes": [],
+            "model_settings": [
+                {"endpoint": "big", "model": "big-1m", "max_context_tokens": 1_000_000},
+                {"endpoint": "small", "model": "small-256k", "max_context_tokens": 256_000},
+            ],
         }))
         sdata = load_settings_file(spath)
-        chain = sdata.routes[0].chain
-        assert chain[0].max_context_tokens == 1_000_000
-        assert chain[1].max_context_tokens is None
+        assert len(sdata.model_settings) == 2
+        assert sdata.model_settings[0].endpoint == "big"
+        assert sdata.model_settings[0].max_context_tokens == 1_000_000
 
     def test_invalid_max_context_tokens_rejected(self, tmp_path):
         from llm_proxy.config import load_settings_file
@@ -321,10 +373,32 @@ class TestSettingsRoundTrip:
 
         spath = tmp_path / "settings.json"
         spath.write_text(json.dumps({
-            "routes": [{
-                "name": "r",
-                "chain": [{"endpoint": "a", "model": "m", "max_context_tokens": 0}],
-            }],
+            "routes": [],
+            "model_settings": [
+                {"endpoint": "a", "model": "m", "max_context_tokens": 0},
+            ],
         }))
         with pytest.raises(Exception):
             load_settings_file(spath)
+
+    def test_chain_step_no_longer_accepts_max_context_tokens(self):
+        """Regression guard — context limits must not live on RouteStepConfig.
+
+        If anyone reintroduces the field on the step the same model could end
+        up with conflicting limits in different routes, which is exactly what
+        the per-model refactor is designed to prevent."""
+        # Pydantic-2: extra fields are ignored by default, so we explicitly
+        # check that it doesn't end up as an attribute.
+        step = RouteStepConfig(
+            endpoint="a", model="m",
+            max_context_tokens=100_000,  # type: ignore[call-arg]
+        )
+        assert not hasattr(step, "max_context_tokens")
+
+    def test_router_get_model_settings_reflects_set(self):
+        router = _two_tier_router()
+        out = router.get_model_settings()
+        assert {(e["endpoint"], e["model"]): e["max_context_tokens"] for e in out} == {
+            ("big", "big-1m"): 1_000_000,
+            ("small", "small-256k"): 256_000,
+        }

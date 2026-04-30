@@ -114,6 +114,8 @@ class Router:
         self._table: RoutingTable = self._build_routing_table()
         # Last discovery result — kept so reload_routing() can re-apply it
         self._last_discovery: dict[str, list[str]] = {}
+        # (endpoint_name, model_name) → max_context_tokens (None = unbounded)
+        self._model_ctx_limits: dict[tuple[str, str], int] = {}
 
     # ------------------------------------------------------------------
     # Table construction
@@ -145,10 +147,7 @@ class Router:
             for step_cfg in route.chain:
                 ep = self._ep_by_name.get(step_cfg.endpoint)
                 if ep is not None:
-                    steps.append(RouteStep(
-                        ep, step_cfg.model, step_cfg.timeout_ms,
-                        step_cfg.max_context_tokens,
-                    ))
+                    steps.append(RouteStep(ep, step_cfg.model, step_cfg.timeout_ms))
                 else:
                     unknown.append(step_cfg.endpoint)
 
@@ -184,10 +183,7 @@ class Router:
             for step_cfg in route.chain:
                 ep = self._ep_by_name.get(step_cfg.endpoint)
                 if ep is not None:
-                    steps.append(RouteStep(
-                        ep, step_cfg.model, step_cfg.timeout_ms,
-                        step_cfg.max_context_tokens,
-                    ))
+                    steps.append(RouteStep(ep, step_cfg.model, step_cfg.timeout_ms))
                 else:
                     unknown.append(step_cfg.endpoint)
             if unknown:
@@ -226,20 +222,51 @@ class Router:
         """
         return self._table.get(name, [])
 
+    def set_model_settings(self, settings) -> None:  # settings: list[ModelSettingConfig]
+        """Replace the (endpoint, model) → max_context_tokens lookup.
+
+        Stored once globally so the same model can never end up with two
+        different limits in two different routes. Steps in any route chain
+        that match an entry here are filtered against the recorded limit
+        during failover.
+        """
+        new_map: dict[tuple[str, str], int] = {}
+        for s in settings:
+            if s.max_context_tokens is None:
+                continue
+            new_map[(s.endpoint, s.model)] = s.max_context_tokens
+        self._model_ctx_limits = new_map
+        logger.info("Loaded %d model context limit(s)", len(new_map))
+
+    def get_model_settings(self) -> list[dict]:
+        """Return the current per-(endpoint, model) settings as plain dicts.
+
+        Suitable for serialising to settings.json or returning from an HTTP
+        API. Only entries with an explicit limit are included.
+        """
+        return [
+            {"endpoint": ep, "model": mdl, "max_context_tokens": limit}
+            for (ep, mdl), limit in sorted(self._model_ctx_limits.items())
+        ]
+
     def filter_by_context(
         self, steps: list[RouteStep], body: dict,
     ) -> list[RouteStep]:
-        """Drop steps whose ``max_context_tokens`` cannot fit ``body``.
+        """Drop steps whose model's context limit cannot fit ``body``.
 
-        Steps with ``max_context_tokens=None`` are always kept (treated as
-        unbounded). If every step is filtered out the caller will see an empty
-        list and surface a clear error to the client instead of failing over
-        into a smaller model that would silently truncate the prompt.
+        Limits live on the Router (set via ``set_model_settings``), keyed by
+        (endpoint_name, model_name). Steps whose pair has no recorded limit
+        are treated as unbounded and always kept. If every step is filtered
+        out the caller will see an empty list and can surface a clear error
+        to the client instead of failing over into a smaller model that
+        would silently truncate the prompt.
         """
+        if not self._model_ctx_limits:
+            return list(steps)
         estimated = estimate_request_tokens(body)
         eligible: list[RouteStep] = []
         for step in steps:
-            limit = step.max_context_tokens
+            limit = self._model_ctx_limits.get((step.endpoint.name, step.model or ""))
             if limit is not None and estimated > limit:
                 logger.warning(
                     "Skipping %r/%r — request ~%d tokens exceeds context limit %d",
@@ -273,7 +300,7 @@ class Router:
         """Return named routes as name → chain description.
 
         Each chain entry is ``{"server": ep_name, "model": model_id,
-        "timeout_ms": int, "max_context_tokens": int | None}``.
+        "timeout_ms": int}``.
         """
         result: dict[str, list[dict[str, object]]] = {}
         for name, steps in self._table.items():
@@ -282,7 +309,6 @@ class Router:
                     "server": s.endpoint.name,
                     "model": s.model or "",
                     "timeout_ms": s.timeout_ms,
-                    "max_context_tokens": s.max_context_tokens,
                 }
                 for s in steps
             ]
