@@ -403,6 +403,53 @@ class TestAnthropicStreaming:
         assert resp.status_code == 200
         assert "event: message_start" in resp.text
 
+    def test_streaming_midcut_falls_over_to_next(self, mock_servers, tmp_path):
+        """If the first upstream cuts mid-SSE, the next endpoint should pick
+        up and the client should still see a clean Anthropic close sequence
+        with content from the recovering endpoint."""
+        # Spin up an extra "cut mid-stream" upstream beside the existing fixtures
+        cut_port = get_free_port()
+        cut_server = MockServer(
+            create_mock_upstream(behavior="stream_cut", name="cutter"),
+            cut_port,
+        )
+        cut_server.start()
+        try:
+            mock_servers["cutter"] = cut_server
+            config = ProxyConfig(
+                proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
+                endpoints=[
+                    EndpointConfig(name="cutter", url=cut_server.url),
+                    EndpointConfig(name="gamma", url=mock_servers["gamma"].url),
+                ],
+                failover=FailoverConfig(max_retries=3),
+                logging=LoggingConfig(db_path=str(tmp_path / "midcut.db")),
+                routing=[
+                    RouteConfig(
+                        name="cut-then-ok",
+                        chain=[
+                            RouteStepConfig(endpoint="cutter", model="mock-model", timeout_ms=5000),
+                            RouteStepConfig(endpoint="gamma", model="mock-model", timeout_ms=5000),
+                        ],
+                    ),
+                ],
+            )
+            app = create_app(config)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post("/v1/messages", json=_anthropic_body("cut-then-ok", stream=True))
+
+            assert resp.status_code == 200
+            text = resp.text
+            # Preamble emitted exactly once
+            assert text.count("event: message_start") == 1
+            # Closing sequence emitted exactly once at the end
+            assert text.count("event: message_stop") == 1
+            # Content from the recovering endpoint reached the client
+            assert "gamma" in text
+        finally:
+            cut_server.stop()
+            mock_servers.pop("cutter", None)
+
     def test_streaming_all_fail_returns_error(self, mock_servers, tmp_path):
         """When all steps fail during streaming → Anthropic error response."""
         config = ProxyConfig(

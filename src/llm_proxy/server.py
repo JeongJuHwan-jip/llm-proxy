@@ -716,93 +716,116 @@ async def _handle_stream(
         raise HTTPException(status_code=502, detail="No endpoints available")
 
     max_attempts = min(len(eligible), router._failover.max_retries + 1)
+    remaining: list[RouteStep] = list(eligible[:max_attempts])
     attempts: list[AttemptLog] = []
+    used_steps: list[RouteStep] = []
 
-    async def _try_stream() -> tuple[httpx.Response, RouteStep, list[AttemptLog]]:
+    async def _try_step(step: RouteStep) -> tuple[httpx.Response | None, RouteStep | None]:
+        """Try one step. Returns (response, step) on success/passthrough,
+        (None, None) on failover-eligible failure (caller advances to next).
+
+        Direct mode preserves the legacy passthrough behaviour: any status
+        (including 5xx) is returned so its body is streamed verbatim to the
+        client.
+        """
         import httpx as _httpx
 
-        for step in eligible[:max_attempts]:
-            ep = step.endpoint
-            model_for_step = step.model or fallback_model
-            body_for_step = {**body, "model": model_for_step}
+        ep = step.endpoint
+        model_for_step = step.model or fallback_model
+        body_for_step = {**body, "model": model_for_step}
 
-            headers = merge_headers(
-                _resolve(ep.headers), extra_headers, cfg.proxy.header_priority,
+        headers = merge_headers(
+            _resolve(ep.headers), extra_headers, cfg.proxy.header_priority,
+        )
+        url = f"{ep.url}{path}"
+        timeout = step.timeout_ms / 1000.0
+        logger.debug(
+            "Upstream request → %s  headers=%s  model=%s",
+            url, headers, model_for_step,
+        )
+        t0 = time.monotonic()
+        _c = clients.get(ep.ssl_verify, clients[True])
+        try:
+            _t = {"connect": timeout, "read": timeout, "write": timeout, "pool": timeout}
+            resp = await _c.send(
+                _c.build_request(
+                    "POST", url, json=body_for_step, headers=headers,
+                    extensions={"timeout": _t},
+                ),
+                stream=True,
             )
-            url = f"{ep.url}{path}"
-            timeout = step.timeout_ms / 1000.0
-            logger.debug(
-                "Upstream request → %s  headers=%s  model=%s",
-                url, headers, model_for_step,
-            )
-            t0 = time.monotonic()
-            _c = clients.get(ep.ssl_verify, clients[True])
-            try:
-                # httpx >=0.20: timeout must be in request extensions, not send()
-                _t = {"connect": timeout, "read": timeout, "write": timeout, "pool": timeout}
-                resp = await _c.send(
-                    _c.build_request(
-                        "POST", url, json=body_for_step, headers=headers,
-                        extensions={"timeout": _t},
-                    ),
-                    stream=True,
+            latency_ms = (time.monotonic() - t0) * 1000
+
+            if _should_failover(resp.status_code):
+                logger.warning(
+                    "Stream upstream %r/%r returned %d — %s",
+                    ep.name, model_for_step, resp.status_code,
+                    "returning error (direct)" if is_direct else "trying next step",
                 )
-                latency_ms = (time.monotonic() - t0) * 1000
-
-                if _should_failover(resp.status_code):
-                    logger.warning(
-                        "Stream upstream %r/%r returned %d — %s",
-                        ep.name, model_for_step, resp.status_code,
-                        "returning error (direct)" if is_direct else "trying next step",
-                    )
-                    if not is_direct:
-                        await resp.aclose()
-                        router.record_failure(ep, is_timeout=False)
+                if is_direct:
                     attempts.append(AttemptLog(
                         endpoint_name=ep.name, latency_ms=latency_ms,
                         success=False, is_timeout=False,
                         error_message=f"HTTP {resp.status_code}",
                     ))
-                    if is_direct:
-                        return resp, step, attempts
-                    continue
+                    used_steps.append(step)
+                    return resp, step
+                await resp.aclose()
+                router.record_failure(ep, is_timeout=False)
+                attempts.append(AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=False, is_timeout=False,
+                    error_message=f"HTTP {resp.status_code}",
+                ))
+                return None, None
 
-                if not is_direct:
-                    router.record_success(ep, latency_ms)
-                attempts.append(AttemptLog(
-                    endpoint_name=ep.name, latency_ms=latency_ms,
-                    success=True, is_timeout=False,
-                ))
-                return resp, step, attempts
-            except _httpx.TimeoutException as exc:
-                latency_ms = (time.monotonic() - t0) * 1000
-                logger.warning("Stream timeout on %r: %s", ep.name, exc)
-                if not is_direct:
-                    router.record_failure(ep, is_timeout=True)
-                attempts.append(AttemptLog(
-                    endpoint_name=ep.name, latency_ms=latency_ms,
-                    success=False, is_timeout=True, error_message=str(exc),
-                ))
-            except Exception as exc:  # noqa: BLE001
-                latency_ms = (time.monotonic() - t0) * 1000
-                logger.warning("Stream error on %r: %s", ep.name, exc)
-                if not is_direct:
-                    router.record_failure(ep, is_timeout=False)
-                attempts.append(AttemptLog(
-                    endpoint_name=ep.name, latency_ms=latency_ms,
-                    success=False, is_timeout=False, error_message=str(exc),
-                ))
-        raise AllEndpointsFailedError(attempts)
+            if not is_direct:
+                router.record_success(ep, latency_ms)
+            attempts.append(AttemptLog(
+                endpoint_name=ep.name, latency_ms=latency_ms,
+                success=True, is_timeout=False,
+            ))
+            used_steps.append(step)
+            return resp, step
+        except _httpx.TimeoutException as exc:
+            latency_ms = (time.monotonic() - t0) * 1000
+            logger.warning("Stream timeout on %r: %s", ep.name, exc)
+            if not is_direct:
+                router.record_failure(ep, is_timeout=True)
+            attempts.append(AttemptLog(
+                endpoint_name=ep.name, latency_ms=latency_ms,
+                success=False, is_timeout=True, error_message=str(exc),
+            ))
+            return None, None
+        except Exception as exc:  # noqa: BLE001
+            latency_ms = (time.monotonic() - t0) * 1000
+            logger.warning("Stream error on %r: %s", ep.name, exc)
+            if not is_direct:
+                router.record_failure(ep, is_timeout=False)
+            attempts.append(AttemptLog(
+                endpoint_name=ep.name, latency_ms=latency_ms,
+                success=False, is_timeout=False, error_message=str(exc),
+            ))
+            return None, None
 
-    try:
-        upstream_resp, winning_step, final_attempts = await _try_stream()
-    except AllEndpointsFailedError as exc:
+    async def next_upstream() -> tuple[httpx.Response, RouteStep] | None:
+        while remaining:
+            step = remaining.pop(0)
+            resp, used = await _try_step(step)
+            if resp is not None:
+                return resp, used
+            if is_direct:
+                return None
+        return None
+
+    first = await next_upstream()
+    if first is None:
         total_ms = (time.monotonic() - t_start) * 1000
         log = RequestLog(
             timestamp=time.time(),
             model=model,
             selected_endpoint=None,
-            attempts=exc.attempts,
+            attempts=attempts,
             status="failure",
             total_latency_ms=total_ms,
             is_stream=True,
@@ -812,44 +835,62 @@ async def _handle_stream(
         events.publish()
         raise HTTPException(status_code=502, detail="All upstream endpoints failed")
 
+    first_resp, first_step = first
+
     async def byte_generator() -> AsyncIterator[bytes]:
-        stream_status = "success"
-        stream_error: str | None = None
+        completed = False
+        current_resp: httpx.Response | None = first_resp
         try:
-            try:
-                async for chunk in upstream_resp.aiter_bytes():
-                    yield chunk
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.warning("Upstream stream interrupted: %s: %s", type(exc).__name__, exc)
-                stream_status = "failure"
-                stream_error = f"{type(exc).__name__}: {exc}"
+            while current_resp is not None:
+                try:
+                    async for chunk in current_resp.aiter_bytes():
+                        yield chunk
+                except asyncio.CancelledError:
+                    try:
+                        await current_resp.aclose()
+                    except Exception:
+                        pass
+                    current_resp = None
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "Upstream stream interrupted: %s: %s",
+                        type(exc).__name__, exc,
+                    )
+                    try:
+                        await current_resp.aclose()
+                    except Exception:
+                        pass
+                    # Mid-stream failover for non-direct mode only.
+                    if is_direct:
+                        current_resp = None
+                        break
+                    nxt = await next_upstream()
+                    if nxt is None:
+                        current_resp = None
+                        break
+                    current_resp, _ = nxt
+                    continue
+                else:
+                    try:
+                        await current_resp.aclose()
+                    except Exception:
+                        pass
+                    completed = True
+                    break
+        finally:
+            if not completed:
                 try:
                     yield b"data: [DONE]\n\n"
                 except Exception:
                     pass
-        finally:
-            try:
-                await upstream_resp.aclose()
-            except Exception:
-                pass
             total_ms = (time.monotonic() - t_start) * 1000
-            logged_attempts = final_attempts
-            if stream_error is not None:
-                logged_attempts = final_attempts + [AttemptLog(
-                    endpoint_name=winning_step.endpoint.name,
-                    latency_ms=0.0,
-                    success=False,
-                    is_timeout=False,
-                    error_message=stream_error,
-                )]
             log = RequestLog(
                 timestamp=time.time(),
                 model=model,
-                selected_endpoint=winning_step.endpoint.name,
-                attempts=logged_attempts,
-                status=stream_status,
+                selected_endpoint=(used_steps[-1].endpoint.name if used_steps else None),
+                attempts=attempts,
+                status="success" if completed else "failure",
                 total_latency_ms=total_ms,
                 is_stream=True,
                 request_body=log_body,
@@ -859,8 +900,8 @@ async def _handle_stream(
 
     return StreamingResponse(
         byte_generator(),
-        status_code=upstream_resp.status_code,
-        media_type=upstream_resp.headers.get("content-type", "text/event-stream"),
+        status_code=first_resp.status_code,
+        media_type=first_resp.headers.get("content-type", "text/event-stream"),
         headers={"X-Accel-Buffering": "no"},
     )
 

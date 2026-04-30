@@ -143,6 +143,51 @@ class TestE2EFailover:
         assert "data:" in body
         assert "gamma" in body
 
+    def test_streaming_midcut_falls_over_to_next(self, mock_servers, tmp_path):
+        """If the first upstream cuts mid-SSE, byte_generator should pull
+        the next endpoint and continue streaming so the client receives content
+        from the recovering endpoint instead of a truncated response."""
+        cut_port = get_free_port()
+        cut_server = MockServer(
+            create_mock_upstream(behavior="stream_cut", name="cutter"),
+            cut_port,
+        )
+        cut_server.start()
+        try:
+            config = ProxyConfig(
+                proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
+                endpoints=[
+                    EndpointConfig(name="cutter", url=cut_server.url),
+                    EndpointConfig(name="gamma", url=mock_servers["gamma"].url),
+                ],
+                failover=FailoverConfig(max_retries=3),
+                logging=LoggingConfig(db_path=str(tmp_path / "midcut_oai.db")),
+                routing=[
+                    RouteConfig(
+                        name="cut-then-ok",
+                        chain=[
+                            RouteStepConfig(endpoint="cutter", model="mock-model", timeout_ms=5000),
+                            RouteStepConfig(endpoint="gamma", model="mock-model", timeout_ms=5000),
+                        ],
+                    ),
+                ],
+            )
+            app = create_app(config)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/chat/completions",
+                    json=_chat_body("cut-then-ok", stream=True),
+                )
+
+            assert resp.status_code == 200
+            text = resp.text
+            # Recovering endpoint's content must reach the client
+            assert "gamma" in text
+            # Stream terminator present
+            assert "[DONE]" in text
+        finally:
+            cut_server.stop()
+
     def test_streaming_request_logged(self, proxy_config):
         """Streaming requests must also be persisted to the request log
         (regression guard: byte_generator's finally block previously fire-and-

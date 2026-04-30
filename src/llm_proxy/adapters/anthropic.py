@@ -16,7 +16,7 @@ import json
 import logging
 import time
 import uuid
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 import httpx
 from fastapi import Request, Response
@@ -350,19 +350,45 @@ async def anthropic_sse_generator(
     upstream_resp: httpx.Response,
     original_model: str,
 ) -> AsyncIterator[str]:
-    """Wrap an OpenAI SSE byte stream, yielding Anthropic SSE events."""
+    """Wrap a single OpenAI SSE byte stream, yielding Anthropic SSE events.
+
+    Thin wrapper over :func:`anthropic_sse_generator_failover` exposing the
+    single-upstream shape kept for tests and direct callers.
+    """
+    state = {"called": False}
+
+    async def factory() -> "tuple[httpx.Response, str] | None":
+        if state["called"]:
+            return None
+        state["called"] = True
+        return upstream_resp, "direct"
+
+    async for event in anthropic_sse_generator_failover(factory, original_model):
+        yield event
+
+
+async def anthropic_sse_generator_failover(
+    next_upstream: "Callable[[], Awaitable[tuple[httpx.Response, str] | None]]",
+    original_model: str,
+) -> AsyncIterator[str]:
+    """Yield Anthropic SSE events, pulling upstream responses from
+    ``next_upstream`` and switching to a new one if the current upstream is
+    cut mid-stream before reporting a finish_reason.
+
+    Preamble events (``message_start``, ``ping``) are emitted exactly once.
+    On each upstream switch any open content block is closed; the new upstream
+    starts a fresh content block. Closing events (``message_delta``,
+    ``message_stop``) are emitted exactly once at the end.
+    """
 
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
-    buf = SSEBuffer()
 
-    # State
+    # State shared across upstream attempts
     block_index = -1
-    current_block_type: str | None = None
     output_tokens = 0
     finish_reason_str: str | None = None
-    block_started = False
 
-    # --- Preamble ---
+    # --- Preamble (once) ---
     yield _sse_event("message_start", {
         "type": "message_start",
         "message": {
@@ -378,105 +404,118 @@ async def anthropic_sse_generator(
     })
     yield _sse_event("ping", {"type": "ping"})
 
-    try:
-        async for raw_chunk in upstream_resp.aiter_bytes():
-            for event_str in buf.feed(raw_chunk):
-                chunk_data = _parse_sse_data(event_str)
-                if chunk_data is None:
-                    # [DONE] — finish up
-                    continue
+    while True:
+        result = await next_upstream()
+        if result is None:
+            break
+        upstream_resp, ep_name = result
 
-                choices = chunk_data.get("choices", [])
-                if not choices:
-                    # usage-only chunk (some providers send this)
+        # Per-upstream state (reset on each switch)
+        buf = SSEBuffer()
+        current_block_type: str | None = None
+        block_started = False
+        upstream_failed = False
+
+        try:
+            async for raw_chunk in upstream_resp.aiter_bytes():
+                for event_str in buf.feed(raw_chunk):
+                    chunk_data = _parse_sse_data(event_str)
+                    if chunk_data is None:
+                        continue
+
+                    choices = chunk_data.get("choices", [])
+                    if not choices:
+                        usage = chunk_data.get("usage")
+                        if usage:
+                            output_tokens = usage.get("completion_tokens", output_tokens)
+                        continue
+
+                    delta = choices[0].get("delta", {})
+                    fr = choices[0].get("finish_reason")
+
                     usage = chunk_data.get("usage")
                     if usage:
                         output_tokens = usage.get("completion_tokens", output_tokens)
-                    continue
 
-                delta = choices[0].get("delta", {})
-                fr = choices[0].get("finish_reason")
-
-                # Capture usage from the chunk if present
-                usage = chunk_data.get("usage")
-                if usage:
-                    output_tokens = usage.get("completion_tokens", output_tokens)
-
-                # --- Text content delta ---
-                text_content = delta.get("content")
-                if text_content is not None:
-                    if current_block_type != "text":
-                        # Close previous block if any
-                        if block_started:
-                            yield _sse_event("content_block_stop", {
-                                "type": "content_block_stop",
+                    text_content = delta.get("content")
+                    if text_content is not None:
+                        if current_block_type != "text":
+                            if block_started:
+                                yield _sse_event("content_block_stop", {
+                                    "type": "content_block_stop",
+                                    "index": block_index,
+                                })
+                            block_index += 1
+                            current_block_type = "text"
+                            block_started = True
+                            yield _sse_event("content_block_start", {
+                                "type": "content_block_start",
                                 "index": block_index,
+                                "content_block": {"type": "text", "text": ""},
                             })
-                        block_index += 1
-                        current_block_type = "text"
-                        block_started = True
-                        yield _sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {"type": "text", "text": ""},
-                        })
 
-                    if text_content:
-                        yield _sse_event("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "text_delta", "text": text_content},
-                        })
-
-                # --- Tool call deltas ---
-                tool_calls = delta.get("tool_calls", [])
-                for tc in tool_calls:
-                    tc_index = tc.get("index", 0)
-                    func = tc.get("function", {})
-                    tc_name = func.get("name")
-                    tc_args = func.get("arguments", "")
-
-                    # New tool call → start a new content block
-                    if tc_name is not None:
-                        if block_started:
-                            yield _sse_event("content_block_stop", {
-                                "type": "content_block_stop",
+                        if text_content:
+                            yield _sse_event("content_block_delta", {
+                                "type": "content_block_delta",
                                 "index": block_index,
+                                "delta": {"type": "text_delta", "text": text_content},
                             })
-                        block_index += 1
-                        current_block_type = "tool_use"
-                        block_started = True
-                        yield _sse_event("content_block_start", {
-                            "type": "content_block_start",
-                            "index": block_index,
-                            "content_block": {
-                                "type": "tool_use",
-                                "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
-                                "name": tc_name,
-                                "input": {},
-                            },
-                        })
 
-                    # Arguments chunk
-                    if tc_args:
-                        yield _sse_event("content_block_delta", {
-                            "type": "content_block_delta",
-                            "index": block_index,
-                            "delta": {"type": "input_json_delta", "partial_json": tc_args},
-                        })
+                    tool_calls = delta.get("tool_calls", [])
+                    for tc in tool_calls:
+                        func = tc.get("function", {})
+                        tc_name = func.get("name")
+                        tc_args = func.get("arguments", "")
 
-                # --- Finish reason ---
-                if fr is not None:
-                    finish_reason_str = fr
+                        if tc_name is not None:
+                            if block_started:
+                                yield _sse_event("content_block_stop", {
+                                    "type": "content_block_stop",
+                                    "index": block_index,
+                                })
+                            block_index += 1
+                            current_block_type = "tool_use"
+                            block_started = True
+                            yield _sse_event("content_block_start", {
+                                "type": "content_block_start",
+                                "index": block_index,
+                                "content_block": {
+                                    "type": "tool_use",
+                                    "id": tc.get("id", f"toolu_{uuid.uuid4().hex[:24]}"),
+                                    "name": tc_name,
+                                    "input": {},
+                                },
+                            })
 
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        logger.warning("Upstream SSE interrupted: %s: %s", type(exc).__name__, exc)
-        if finish_reason_str is None:
-            finish_reason_str = "stop"
-    finally:
-        # Close the last content block
+                        if tc_args:
+                            yield _sse_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": block_index,
+                                "delta": {"type": "input_json_delta", "partial_json": tc_args},
+                            })
+
+                    if fr is not None:
+                        finish_reason_str = fr
+
+        except asyncio.CancelledError:
+            try:
+                await upstream_resp.aclose()
+            except Exception:
+                pass
+            raise
+        except Exception as exc:
+            logger.warning(
+                "Upstream SSE interrupted on %s: %s: %s",
+                ep_name, type(exc).__name__, exc,
+            )
+            upstream_failed = True
+        finally:
+            try:
+                await upstream_resp.aclose()
+            except Exception:
+                pass
+
+        # Close any block left open by this upstream before switching/finishing
         if block_started:
             try:
                 yield _sse_event("content_block_stop", {
@@ -486,17 +525,23 @@ async def anthropic_sse_generator(
             except Exception:
                 pass
 
-        # message_delta with stop_reason
-        stop_reason = _FINISH_REASON_MAP.get(finish_reason_str or "stop", "end_turn")
-        try:
-            yield _sse_event("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
-            })
-            yield _sse_event("message_stop", {"type": "message_stop"})
-        except Exception:
-            pass
+        # Decide whether to retry on the next upstream
+        if not upstream_failed:
+            break  # upstream completed normally
+        if finish_reason_str is not None:
+            break  # logically complete, only the trailing termination was cut
+
+    # --- Close-out (once) ---
+    stop_reason = _FINISH_REASON_MAP.get(finish_reason_str or "stop", "end_turn")
+    try:
+        yield _sse_event("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        })
+        yield _sse_event("message_stop", {"type": "message_stop"})
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -669,13 +714,16 @@ async def _handle_anthropic_stream(
         return anthropic_error("api_error", "No endpoints available", 502)
 
     max_attempts = min(len(eligible), router._failover.max_retries + 1)
+    remaining: list[RouteStep] = list(eligible[:max_attempts])
     attempts: list[AttemptLog] = []
+    used_steps: list[RouteStep] = []
 
-    # --- Step iteration (mirrors server._handle_stream._try_stream) ---
-    upstream_resp: httpx.Response | None = None
-    winning_step: RouteStep | None = None
-
-    for step in eligible[:max_attempts]:
+    async def _try_step(step: RouteStep) -> "tuple[httpx.Response | None, int | None]":
+        """Try one step. Returns (response, status_code).
+        - (resp, 200): success, response is open and ready to stream.
+        - (None, status): non-failover status (direct mode error path).
+        - (None, None): failover-eligible failure (5xx/timeout/exc); try next.
+        """
         ep = step.endpoint
         model_for_step = step.model or fallback_model
         body_for_step = {**oai_body, "model": model_for_step}
@@ -700,28 +748,26 @@ async def _handle_anthropic_stream(
             latency_ms = (time.monotonic() - t0) * 1000
 
             if _should_failover(resp.status_code):
+                await resp.aclose()
                 if not is_direct:
-                    await resp.aclose()
                     router.record_failure(ep, is_timeout=False)
                 attempts.append(AttemptLog(
                     endpoint_name=ep.name, latency_ms=latency_ms,
                     success=False, is_timeout=False,
                     error_message=f"HTTP {resp.status_code}",
                 ))
-                if is_direct:
-                    # Return error in Anthropic format
-                    await resp.aclose()
-                    total_ms = (time.monotonic() - t_start) * 1000
-                    log = RequestLog(
-                        timestamp=time.time(), model=original_model,
-                        selected_endpoint=ep.name, attempts=attempts,
-                        status="failure", total_latency_ms=total_ms,
-                        is_stream=True, request_body=log_body,
-                    )
-                    await loop.run_in_executor(None, db.insert_request_log, log)
-                    events.publish()
-                    return anthropic_error("api_error", f"Upstream returned HTTP {resp.status_code}", resp.status_code)
-                continue
+                return None, None
+
+            if resp.status_code != 200:
+                # Direct-mode passthrough of non-failover error codes
+                status = resp.status_code
+                await resp.aclose()
+                attempts.append(AttemptLog(
+                    endpoint_name=ep.name, latency_ms=latency_ms,
+                    success=False, is_timeout=False,
+                    error_message=f"HTTP {status}",
+                ))
+                return None, status
 
             if not is_direct:
                 router.record_success(ep, latency_ms)
@@ -729,9 +775,8 @@ async def _handle_anthropic_stream(
                 endpoint_name=ep.name, latency_ms=latency_ms,
                 success=True, is_timeout=False,
             ))
-            upstream_resp = resp
-            winning_step = step
-            break
+            used_steps.append(step)
+            return resp, 200
 
         except httpx.TimeoutException as exc:
             latency_ms = (time.monotonic() - t0) * 1000
@@ -741,6 +786,7 @@ async def _handle_anthropic_stream(
                 endpoint_name=ep.name, latency_ms=latency_ms,
                 success=False, is_timeout=True, error_message=str(exc),
             ))
+            return None, None
         except Exception as exc:
             latency_ms = (time.monotonic() - t0) * 1000
             if not is_direct:
@@ -749,38 +795,71 @@ async def _handle_anthropic_stream(
                 endpoint_name=ep.name, latency_ms=latency_ms,
                 success=False, is_timeout=False, error_message=str(exc),
             ))
+            return None, None
 
-    # All steps failed
-    if upstream_resp is None:
+    async def next_upstream() -> "tuple[httpx.Response, str] | None":
+        """Pull the next available upstream, advancing through remaining steps.
+
+        Direct mode: a non-failover status from the step is returned to the
+        client by ``_handle_anthropic_stream`` only on the *first* call (before
+        committing to a streaming response). Once streaming has started, direct
+        mode does not retry on mid-stream cuts.
+        """
+        while remaining:
+            step = remaining.pop(0)
+            resp, status = await _try_step(step)
+            if resp is not None:
+                return resp, step.endpoint.name
+            # Non-failover status in direct mode: surface it via marker
+            if is_direct and status is not None:
+                # Stash the status so the first-call path can return it
+                next_upstream._direct_status = status  # type: ignore[attr-defined]
+                return None
+            if is_direct:
+                # Direct mode failover-eligible failure — also stop trying
+                return None
+        return None
+
+    # --- First attempt: must succeed before we commit to a streaming response ---
+    first = await next_upstream()
+    if first is None:
         total_ms = (time.monotonic() - t_start) * 1000
         log = RequestLog(
             timestamp=time.time(), model=original_model,
-            selected_endpoint=None, attempts=attempts,
+            selected_endpoint=(used_steps[-1].endpoint.name if used_steps else None),
+            attempts=attempts,
             status="failure", total_latency_ms=total_ms,
             is_stream=True, request_body=log_body,
         )
         await loop.run_in_executor(None, db.insert_request_log, log)
         events.publish()
+        direct_status = getattr(next_upstream, "_direct_status", None)
+        if is_direct and direct_status is not None:
+            return anthropic_error(
+                "api_error", f"Upstream returned HTTP {direct_status}", direct_status,
+            )
         return anthropic_error("api_error", "All upstream endpoints failed", 502)
 
-    # --- Wrap the upstream SSE stream with Anthropic translation ---
-    final_attempts = attempts
-    final_winning_step = winning_step
+    cached: list["tuple[httpx.Response, str] | None"] = [first]
+
+    async def factory() -> "tuple[httpx.Response, str] | None":
+        if cached:
+            return cached.pop()
+        # Direct mode: never retry mid-stream
+        if is_direct:
+            return None
+        return await next_upstream()
 
     async def wrapped_generator() -> AsyncIterator[str]:
         try:
-            async for event_str in anthropic_sse_generator(upstream_resp, original_model):
+            async for event_str in anthropic_sse_generator_failover(factory, original_model):
                 yield event_str
         finally:
-            try:
-                await upstream_resp.aclose()
-            except Exception:
-                pass
             total_ms = (time.monotonic() - t_start) * 1000
             log = RequestLog(
                 timestamp=time.time(), model=original_model,
-                selected_endpoint=final_winning_step.endpoint.name,
-                attempts=final_attempts, status="success",
+                selected_endpoint=(used_steps[-1].endpoint.name if used_steps else None),
+                attempts=attempts, status="success",
                 total_latency_ms=total_ms, is_stream=True,
                 request_body=log_body,
             )
