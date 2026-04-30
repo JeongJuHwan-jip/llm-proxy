@@ -469,23 +469,34 @@ async def anthropic_sse_generator(
                 if fr is not None:
                     finish_reason_str = fr
 
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        logger.warning("Upstream SSE interrupted: %s: %s", type(exc).__name__, exc)
+        if finish_reason_str is None:
+            finish_reason_str = "stop"
     finally:
         # Close the last content block
         if block_started:
-            yield _sse_event("content_block_stop", {
-                "type": "content_block_stop",
-                "index": block_index,
-            })
+            try:
+                yield _sse_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": block_index,
+                })
+            except Exception:
+                pass
 
         # message_delta with stop_reason
         stop_reason = _FINISH_REASON_MAP.get(finish_reason_str or "stop", "end_turn")
-        yield _sse_event("message_delta", {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-            "usage": {"output_tokens": output_tokens},
-        })
-
-        yield _sse_event("message_stop", {"type": "message_stop"})
+        try:
+            yield _sse_event("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens},
+            })
+            yield _sse_event("message_stop", {"type": "message_stop"})
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -761,7 +772,10 @@ async def _handle_anthropic_stream(
             async for event_str in anthropic_sse_generator(upstream_resp, original_model):
                 yield event_str
         finally:
-            await upstream_resp.aclose()
+            try:
+                await upstream_resp.aclose()
+            except Exception:
+                pass
             total_ms = (time.monotonic() - t_start) * 1000
             log = RequestLog(
                 timestamp=time.time(), model=original_model,

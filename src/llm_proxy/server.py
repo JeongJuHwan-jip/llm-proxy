@@ -813,18 +813,43 @@ async def _handle_stream(
         raise HTTPException(status_code=502, detail="All upstream endpoints failed")
 
     async def byte_generator() -> AsyncIterator[bytes]:
+        stream_status = "success"
+        stream_error: str | None = None
         try:
-            async for chunk in upstream_resp.aiter_bytes():
-                yield chunk
+            try:
+                async for chunk in upstream_resp.aiter_bytes():
+                    yield chunk
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("Upstream stream interrupted: %s: %s", type(exc).__name__, exc)
+                stream_status = "failure"
+                stream_error = f"{type(exc).__name__}: {exc}"
+                try:
+                    yield b"data: [DONE]\n\n"
+                except Exception:
+                    pass
         finally:
-            await upstream_resp.aclose()
+            try:
+                await upstream_resp.aclose()
+            except Exception:
+                pass
             total_ms = (time.monotonic() - t_start) * 1000
+            logged_attempts = final_attempts
+            if stream_error is not None:
+                logged_attempts = final_attempts + [AttemptLog(
+                    endpoint_name=winning_step.endpoint.name,
+                    latency_ms=0.0,
+                    success=False,
+                    is_timeout=False,
+                    error_message=stream_error,
+                )]
             log = RequestLog(
                 timestamp=time.time(),
                 model=model,
                 selected_endpoint=winning_step.endpoint.name,
-                attempts=final_attempts,
-                status="success",
+                attempts=logged_attempts,
+                status=stream_status,
                 total_latency_ms=total_ms,
                 is_stream=True,
                 request_body=log_body,

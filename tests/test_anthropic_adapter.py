@@ -10,9 +10,13 @@ import json
 
 import pytest
 
+import httpx
+import pytest_asyncio  # noqa: F401
+
 from llm_proxy.adapters.anthropic import (
     SSEBuffer,
     _parse_sse_data,
+    anthropic_sse_generator,
     translate_request,
     translate_response,
 )
@@ -551,3 +555,66 @@ class TestParseSSEData:
 
     def test_no_data_line(self):
         assert _parse_sse_data("event: ping") is None
+
+
+# ---------------------------------------------------------------------------
+# anthropic_sse_generator — graceful close on mid-stream upstream error
+# ---------------------------------------------------------------------------
+
+
+class _FakeUpstream:
+    """Mimics httpx.Response.aiter_bytes() — yields then raises."""
+
+    def __init__(self, chunks: list[bytes], exc: Exception | None) -> None:
+        self._chunks = chunks
+        self._exc = exc
+
+    async def aiter_bytes(self):
+        for c in self._chunks:
+            yield c
+        if self._exc is not None:
+            raise self._exc
+
+
+class TestSSEGeneratorMidStreamError:
+    """If upstream disconnects mid-SSE, the generator must still emit a
+    well-formed Anthropic close sequence so the client doesn't see a raw
+    socket abort."""
+
+    @pytest.mark.asyncio
+    async def test_remote_protocol_error_yields_clean_close(self):
+        # First chunk: a single OpenAI text delta
+        chunk = (
+            b'data: {"choices":[{"index":0,"delta":{"content":"Hello"}}]}\n\n'
+        )
+        upstream = _FakeUpstream(
+            chunks=[chunk],
+            exc=httpx.RemoteProtocolError("peer closed connection"),
+        )
+
+        events: list[str] = []
+        async for ev in anthropic_sse_generator(upstream, "claude-3-sonnet"):
+            events.append(ev)
+
+        joined = "".join(events)
+        # Must include the standard Anthropic preamble and close sequence
+        assert "event: message_start" in joined
+        assert "event: content_block_start" in joined
+        assert "event: content_block_delta" in joined
+        assert "event: content_block_stop" in joined
+        assert "event: message_delta" in joined
+        assert "event: message_stop" in joined
+
+    @pytest.mark.asyncio
+    async def test_read_timeout_yields_clean_close(self):
+        upstream = _FakeUpstream(chunks=[], exc=httpx.ReadTimeout("idle"))
+
+        events: list[str] = []
+        async for ev in anthropic_sse_generator(upstream, "claude-3-sonnet"):
+            events.append(ev)
+
+        joined = "".join(events)
+        # No content was streamed, but close sequence must still be present
+        assert "event: message_start" in joined
+        assert "event: message_delta" in joined
+        assert "event: message_stop" in joined
