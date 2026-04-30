@@ -45,6 +45,18 @@ Behaviors:
 Latency:
     --latency-min / --latency-max add random delay to ALL successful
     responses (applied on top of behavior-specific delays).
+
+Runtime control:
+    Open http://localhost:<port>/ in a browser for a control panel that lets
+    you inject errors (once or persistently) without restarting the server.
+    Programmatic API:
+        POST /control/inject  {"mode":"once"|"persistent","behavior":"error","status_code":503}
+        POST /control/inject  {"mode":"once","behavior":"timeout"}
+        POST /control/inject  {"mode":"persistent","behavior":"slow","delay":3.0}
+        POST /control/clear   {"target":"queue"|"persistent"|"all"}
+        GET  /control/state
+    Queued (once) injections take priority over the persistent setting,
+    which takes priority over the CLI --behavior flag.
 """
 
 import argparse
@@ -52,11 +64,12 @@ import asyncio
 import json
 import random
 import time
-from typing import AsyncIterator
+from pathlib import Path
+from typing import Any, AsyncIterator
 
 import uvicorn
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 parser = argparse.ArgumentParser(description="Mock LLM server")
 parser.add_argument("--port", type=int, default=8001)
@@ -91,6 +104,64 @@ MODEL_IDS: list[str] = (
 app = FastAPI(title=f"Mock LLM ({SERVER_NAME})")
 
 _request_count = 0
+
+# ── Runtime injection state ────────────────────────────────────────────────
+# `_injection_queue` is a FIFO of one-shot overrides; each request consumes one.
+# `_injection_persistent` applies whenever the queue is empty.
+# Both override args.behavior. Set/cleared via /control/* endpoints.
+_injection_queue: list[dict[str, Any]] = []
+_injection_persistent: dict[str, Any] | None = None
+
+_PANEL_PATH = Path(__file__).with_name("mock_llm_panel.html")
+
+
+def _normalize_injection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate and normalize an inject request body into a stored injection."""
+    behavior = payload.get("behavior")
+    if behavior not in {"error", "timeout", "slow", "ok"}:
+        raise HTTPException(400, f"invalid behavior: {behavior!r}")
+
+    if behavior == "error":
+        status = payload.get("status_code")
+        if not isinstance(status, int) or not (100 <= status <= 599):
+            raise HTTPException(400, "error behavior requires status_code in 100..599")
+        return {
+            "behavior": "error",
+            "status_code": status,
+            "message": payload.get("message") or f"Injected HTTP {status}",
+        }
+
+    if behavior == "slow":
+        delay = payload.get("delay")
+        if not isinstance(delay, (int, float)) or delay < 0:
+            raise HTTPException(400, "slow behavior requires non-negative delay")
+        return {"behavior": "slow", "delay": float(delay)}
+
+    if behavior == "timeout":
+        return {"behavior": "timeout"}
+
+    return {"behavior": "ok"}
+
+
+async def _apply_injection(injection: dict[str, Any]) -> JSONResponse | None:
+    """Execute an injection. Returns a Response if it short-circuits the
+    handler, or None if the handler should continue with normal processing."""
+    b = injection["behavior"]
+    if b == "error":
+        return JSONResponse(
+            status_code=injection["status_code"],
+            content={"error": {
+                "message": injection.get("message", "Injected error"),
+                "type": "injected_error",
+            }},
+        )
+    if b == "timeout":
+        await asyncio.sleep(9999)
+        return JSONResponse(status_code=504, content={"error": {"message": "timeout"}})
+    if b == "slow":
+        await asyncio.sleep(injection["delay"])
+        return None  # fall through to normal response
+    return None  # "ok" — also falls through
 
 
 def _make_response(model: str, content: str) -> dict:
@@ -163,10 +234,27 @@ async def chat_completions(request: Request):
     model = body.get("model", "mock-model")
     is_stream = body.get("stream", False)
 
+    # ── Runtime injection (queue first, then persistent) ───────────────────
+    active_injection: dict[str, Any] | None = None
+    if _injection_queue:
+        active_injection = _injection_queue.pop(0)
+    elif _injection_persistent is not None:
+        active_injection = _injection_persistent
+
+    if active_injection is not None:
+        print(f"[{SERVER_NAME}] #{count} model={model!r} stream={is_stream} INJECTED={active_injection}")
+        short_circuit = await _apply_injection(active_injection)
+        if short_circuit is not None:
+            return short_circuit
+        # slow/ok injections fall through to normal response below
+
     print(f"[{SERVER_NAME}] #{count} model={model!r} stream={is_stream} behavior={args.behavior}")
 
     # ── Apply behavior ──────────────────────────────────────────────────────
-    if args.behavior == "timeout":
+    if active_injection is not None:
+        # Injection ran (slow/ok). Skip CLI behavior and go straight to normal response.
+        pass
+    elif args.behavior == "timeout":
         print(f"[{SERVER_NAME}] Hanging forever...")
         await asyncio.sleep(9999)  # proxy will timeout first
 
@@ -231,6 +319,72 @@ async def list_models():
 @app.get("/health")
 async def health():
     return {"status": "ok", "server": SERVER_NAME, "requests": _request_count}
+
+
+# ── Control panel & API ────────────────────────────────────────────────────
+
+
+@app.get("/")
+async def control_panel():
+    return FileResponse(_PANEL_PATH, media_type="text/html")
+
+
+@app.get("/control/state")
+async def control_state():
+    return {
+        "name": SERVER_NAME,
+        "port": args.port,
+        "default_behavior": args.behavior,
+        "request_count": _request_count,
+        "persistent_injection": _injection_persistent,
+        "queue": list(_injection_queue),
+    }
+
+
+@app.post("/control/inject")
+async def control_inject(request: Request):
+    global _injection_persistent
+    try:
+        payload = await request.json()
+    except Exception as exc:
+        raise HTTPException(400, f"invalid JSON body: {exc}")
+    if not isinstance(payload, dict):
+        raise HTTPException(400, "body must be an object")
+
+    mode = payload.get("mode", "once")
+    if mode not in {"once", "persistent"}:
+        raise HTTPException(400, f"mode must be 'once' or 'persistent', got {mode!r}")
+
+    injection = _normalize_injection(payload)
+
+    if mode == "once":
+        _injection_queue.append(injection)
+        print(f"[{SERVER_NAME}] Queued injection: {injection}")
+    else:
+        _injection_persistent = injection
+        print(f"[{SERVER_NAME}] Set persistent injection: {injection}")
+
+    return {"ok": True, "mode": mode, "injection": injection}
+
+
+@app.post("/control/clear")
+async def control_clear(request: Request):
+    global _injection_persistent
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    target = payload.get("target", "all") if isinstance(payload, dict) else "all"
+    if target not in {"queue", "persistent", "all"}:
+        raise HTTPException(400, f"invalid target: {target!r}")
+
+    if target in {"queue", "all"}:
+        _injection_queue.clear()
+    if target in {"persistent", "all"}:
+        _injection_persistent = None
+
+    print(f"[{SERVER_NAME}] Cleared {target}")
+    return {"ok": True, "cleared": target}
 
 
 if __name__ == "__main__":

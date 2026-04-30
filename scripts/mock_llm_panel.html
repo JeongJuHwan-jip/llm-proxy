@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Mock LLM Control</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: ui-monospace, "Cascadia Mono", Consolas, Menlo, monospace;
+    background: #0f1115; color: #e6e6e6;
+    margin: 0; padding: 24px;
+    max-width: 880px; margin-inline: auto;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #8a8f99; font-size: 13px; margin-bottom: 18px; }
+  section {
+    background: #161922; border: 1px solid #232734;
+    border-radius: 8px; padding: 16px; margin-bottom: 14px;
+  }
+  h2 { font-size: 13px; margin: 0 0 12px; color: #9aa0aa; text-transform: uppercase; letter-spacing: 0.06em; }
+  button {
+    background: #232734; color: #e6e6e6; border: 1px solid #2f3445;
+    padding: 6px 12px; border-radius: 5px; cursor: pointer;
+    font: inherit; font-size: 13px; margin: 2px;
+  }
+  button:hover { background: #2c3142; }
+  button.primary { background: #2563eb; border-color: #2563eb; }
+  button.primary:hover { background: #1e4fd1; }
+  button.danger { background: #4a1a1a; border-color: #6b2424; }
+  button.danger:hover { background: #6b2424; }
+  button.active { background: #1e4fd1; border-color: #2563eb; }
+  input, select {
+    background: #0f1115; color: #e6e6e6; border: 1px solid #2f3445;
+    padding: 6px 10px; border-radius: 5px; font: inherit; font-size: 13px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+  .label { color: #8a8f99; font-size: 12px; min-width: 64px; }
+  .pill {
+    display: inline-block; padding: 2px 8px; border-radius: 10px;
+    background: #232734; font-size: 12px; margin-right: 6px;
+  }
+  .pill.persist { background: #1e4fd1; }
+  .pill.queue { background: #4a3a1a; }
+  .empty { color: #5a5f6b; font-style: italic; }
+  pre {
+    background: #0a0c11; padding: 10px; border-radius: 5px;
+    margin: 0; font-size: 12px; overflow: auto; max-height: 180px;
+  }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 600px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<h1>Mock LLM Control Panel</h1>
+<div class="sub" id="header-sub">Loading…</div>
+
+<section>
+  <h2>Inject behavior</h2>
+
+  <div class="row">
+    <span class="label">Mode</span>
+    <button id="mode-once" class="active" onclick="setMode('once')">Once (next request)</button>
+    <button id="mode-persistent" onclick="setMode('persistent')">Persistent (all future)</button>
+  </div>
+
+  <div class="row">
+    <span class="label">Errors</span>
+    <button onclick="injectError(400)">400</button>
+    <button onclick="injectError(401)">401</button>
+    <button onclick="injectError(403)">403</button>
+    <button onclick="injectError(408)">408</button>
+    <button onclick="injectError(429)">429</button>
+    <button onclick="injectError(500)">500</button>
+    <button onclick="injectError(502)">502</button>
+    <button onclick="injectError(503)">503</button>
+    <button onclick="injectError(504)">504</button>
+  </div>
+
+  <div class="row">
+    <span class="label">Custom</span>
+    <input id="custom-status" type="number" placeholder="status" style="width: 90px" min="100" max="599">
+    <button onclick="injectCustom()">Inject status</button>
+    <input id="custom-delay" type="number" placeholder="seconds" style="width: 90px" step="0.1" min="0">
+    <button onclick="injectSlow()">Inject slow</button>
+  </div>
+
+  <div class="row">
+    <span class="label">Special</span>
+    <button onclick="injectTimeout()">Timeout (hang)</button>
+    <button onclick="injectOk()">Force OK</button>
+  </div>
+</section>
+
+<section>
+  <h2>Current state</h2>
+
+  <div class="row">
+    <span class="label">Persistent</span>
+    <span id="persistent-display" class="empty">none</span>
+    <button class="danger" onclick="clearTarget('persistent')">Clear</button>
+  </div>
+
+  <div class="row" style="align-items: flex-start">
+    <span class="label">Queue</span>
+    <div style="flex: 1">
+      <div id="queue-display" class="empty">empty</div>
+    </div>
+    <button class="danger" onclick="clearTarget('queue')">Clear</button>
+  </div>
+
+  <div class="row">
+    <button class="danger" onclick="clearTarget('all')">Clear ALL</button>
+  </div>
+</section>
+
+<section>
+  <h2>Stats</h2>
+  <div class="grid">
+    <div>Requests served: <span id="stat-requests">0</span></div>
+    <div>Default behavior: <span id="stat-default">-</span></div>
+  </div>
+</section>
+
+<script>
+let mode = 'once';
+
+function setMode(m) {
+  mode = m;
+  document.getElementById('mode-once').classList.toggle('active', m === 'once');
+  document.getElementById('mode-persistent').classList.toggle('active', m === 'persistent');
+}
+
+async function inject(payload) {
+  const body = { mode, ...payload };
+  const r = await fetch('/control/inject', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const text = await r.text();
+    alert('Inject failed: ' + text);
+    return;
+  }
+  refresh();
+}
+
+function injectError(status) {
+  inject({ behavior: 'error', status_code: status });
+}
+
+function injectCustom() {
+  const v = parseInt(document.getElementById('custom-status').value, 10);
+  if (!Number.isFinite(v) || v < 100 || v > 599) {
+    alert('Enter a valid HTTP status (100-599)');
+    return;
+  }
+  inject({ behavior: 'error', status_code: v });
+}
+
+function injectSlow() {
+  const v = parseFloat(document.getElementById('custom-delay').value);
+  if (!Number.isFinite(v) || v < 0) {
+    alert('Enter a non-negative delay in seconds');
+    return;
+  }
+  inject({ behavior: 'slow', delay: v });
+}
+
+function injectTimeout() {
+  inject({ behavior: 'timeout' });
+}
+
+function injectOk() {
+  inject({ behavior: 'ok' });
+}
+
+async function clearTarget(target) {
+  await fetch('/control/clear', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ target }),
+  });
+  refresh();
+}
+
+function describe(inj) {
+  if (!inj) return null;
+  const b = inj.behavior;
+  if (b === 'error') return `error ${inj.status_code}`;
+  if (b === 'slow') return `slow ${inj.delay}s`;
+  if (b === 'timeout') return 'timeout';
+  if (b === 'ok') return 'ok (forced)';
+  return JSON.stringify(inj);
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/control/state');
+    const s = await r.json();
+
+    document.getElementById('header-sub').textContent =
+      `Server: ${s.name}  ·  port ${s.port}  ·  default: ${s.default_behavior}`;
+    document.getElementById('stat-requests').textContent = s.request_count;
+    document.getElementById('stat-default').textContent = s.default_behavior;
+
+    const persistEl = document.getElementById('persistent-display');
+    if (s.persistent_injection) {
+      persistEl.innerHTML = `<span class="pill persist">${describe(s.persistent_injection)}</span>`;
+    } else {
+      persistEl.innerHTML = '<span class="empty">none</span>';
+    }
+
+    const qEl = document.getElementById('queue-display');
+    if (s.queue && s.queue.length) {
+      qEl.innerHTML = s.queue.map((q, i) =>
+        `<span class="pill queue">#${i + 1} ${describe(q)}</span>`
+      ).join('');
+    } else {
+      qEl.innerHTML = '<span class="empty">empty</span>';
+    }
+  } catch (e) {
+    document.getElementById('header-sub').textContent = 'Disconnected: ' + e.message;
+  }
+}
+
+refresh();
+setInterval(refresh, 1000);
+</script>
+</body>
+</html>
