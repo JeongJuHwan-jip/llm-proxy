@@ -370,6 +370,8 @@ async def anthropic_sse_generator(
 async def anthropic_sse_generator_failover(
     next_upstream: "Callable[[], Awaitable[tuple[httpx.Response, str] | None]]",
     original_model: str,
+    *,
+    emit_close_on_cut: bool = True,
 ) -> AsyncIterator[str]:
     """Yield Anthropic SSE events, pulling upstream responses from
     ``next_upstream`` and switching to a new one if the current upstream is
@@ -379,6 +381,13 @@ async def anthropic_sse_generator_failover(
     On each upstream switch any open content block is closed; the new upstream
     starts a fresh content block. Closing events (``message_delta``,
     ``message_stop``) are emitted exactly once at the end.
+
+    ``emit_close_on_cut`` — when False, the trailing ``message_delta`` /
+    ``message_stop`` are suppressed if the upstream cut without producing a
+    finish_reason. This avoids advertising a clean ``stop_reason`` (and a
+    parseable terminator) when the underlying tool_use input_json is
+    actually truncated — clients then see a mid-message connection close
+    rather than parsing partial JSON.
     """
 
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -387,6 +396,7 @@ async def anthropic_sse_generator_failover(
     block_index = -1
     output_tokens = 0
     finish_reason_str: str | None = None
+    last_upstream_failed = False
 
     # --- Preamble (once) ---
     yield _sse_event("message_start", {
@@ -525,6 +535,7 @@ async def anthropic_sse_generator_failover(
             except Exception:
                 pass
 
+        last_upstream_failed = upstream_failed
         # Decide whether to retry on the next upstream
         if not upstream_failed:
             break  # upstream completed normally
@@ -532,6 +543,12 @@ async def anthropic_sse_generator_failover(
             break  # logically complete, only the trailing termination was cut
 
     # --- Close-out (once) ---
+    # Suppress the synthetic terminator when (a) reconnect is disabled and
+    # (b) the upstream cut without producing a finish_reason. Emitting a
+    # clean message_stop on top of a truncated tool_use would let the
+    # client parse partial input_json as if it were complete.
+    if not emit_close_on_cut and last_upstream_failed and finish_reason_str is None:
+        return
     stop_reason = _FINISH_REASON_MAP.get(finish_reason_str or "stop", "end_turn")
     try:
         yield _sse_event("message_delta", {
@@ -854,7 +871,10 @@ async def _handle_anthropic_stream(
 
     async def wrapped_generator() -> AsyncIterator[str]:
         try:
-            async for event_str in anthropic_sse_generator_failover(factory, original_model):
+            async for event_str in anthropic_sse_generator_failover(
+                factory, original_model,
+                emit_close_on_cut=reconnect_enabled,
+            ):
                 yield event_str
         finally:
             total_ms = (time.monotonic() - t_start) * 1000

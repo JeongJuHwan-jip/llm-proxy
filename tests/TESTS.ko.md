@@ -151,6 +151,8 @@
 - **test_streaming_midcut_falls_over_to_next** — 스트리밍 도중 업스트림이 끊기면(`stream_cut` mock) `byte_generator`가 다음 endpoint로 자동 전환해 끊김 없이 클라이언트에 콘텐츠 전달.
 - **test_streaming_tool_call_cut_does_not_leak_partial** — tool_call 인자 도중 업스트림이 끊겨도 partial JSON이 클라이언트에 노출되지 않고, 회복 endpoint의 완전한 tool_call만 전달됨 (Roo Code 류 클라이언트의 `index` 기반 tool_call 병합 충돌 방지). 클라이언트가 보는 청크들에서 `arguments`를 합쳐 보면 `{"path":"b.txt","diff":"+ok"}`로 정상 파싱.
 - **test_streaming_tool_call_reconnect_disabled_passes_through** — `streaming.tool_call_reconnect: false`로 설정하면 프록시는 업스트림 바이트를 그대로 전달하고(끊긴 endpoint의 partial tool_call이 클라이언트에 도달), 다음 업스트림으로 재접속하지 않음(회복 endpoint 콘텐츠 미전달).
+- **test_streaming_passthrough_healthy_upstream_byte_identical** — 패스스루 + 정상 업스트림: 클라이언트가 받은 SSE 청크들에서 `arguments`를 합쳐 보면 valid JSON으로 파싱되고 `[DONE]`은 정확히 1번만 등장 (패스스루 경로에 바이트 손상 회귀 가드).
+- **test_streaming_passthrough_cut_does_not_synthesize_done** — 패스스루 모드에서 업스트림이 tool_call 도중 끊기면 partial 바이트는 클라이언트에 도달하되 합성된 `data: [DONE]`은 발생하지 않음 (이전 버그: 합성된 `[DONE]` 때문에 클라이언트가 partial JSON을 완성된 stream으로 오인하고 `JSON Parse error: Expected '}'` 발생).
 - **test_streaming_request_logged** — 스트리밍 요청도 SQLite 로그에 `is_stream=True`로 기록 (회귀 가드: `byte_generator`의 finally 블록이 fire-and-forget로 로그를 누락했던 버그 방지).
 
 ### `TestE2EAllFail`
@@ -261,7 +263,7 @@
 - **test_streaming_failover** — 스트리밍에서도 페일오버 동작 (gamma 응답).
 - **test_streaming_direct_to_healthy** — 직접 지정 스트리밍 동작.
 - **test_streaming_midcut_falls_over_to_next** — 스트리밍 도중 업스트림이 끊기면(`stream_cut` mock) Anthropic 어댑터가 다음 endpoint로 전환, `message_start`/`message_stop`은 정확히 1번씩, 회복 endpoint(gamma) 콘텐츠가 포함됨.
-- **test_streaming_midcut_no_reconnect_when_disabled** — `streaming.tool_call_reconnect: false`이면 Anthropic 스트리밍에서도 중간 끊김 발생 시 다음 endpoint로 전환하지 않음(회복 endpoint(gamma) 콘텐츠 미포함).
+- **test_streaming_midcut_no_reconnect_when_disabled** — `streaming.tool_call_reconnect: false`이면 Anthropic 스트리밍에서도 중간 끊김 발생 시 다음 endpoint로 전환하지 않고(회복 endpoint(gamma) 콘텐츠 미포함), 합성된 `event: message_stop`도 송출하지 않음 (잘린 tool_use input_json을 클라이언트가 정상 종료된 메시지로 파싱하지 않도록).
 - **test_streaming_all_fail_returns_error** — 스트리밍 중 모든 step 실패 → 502 + Anthropic error JSON.
 
 ### `TestOpenAIRegressionFromAnthropicTests` — OpenAI 회귀 검증
