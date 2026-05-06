@@ -318,6 +318,99 @@ class TestE2EFailover:
             cut_server.stop()
             ok_server.stop()
 
+    def test_streaming_passthrough_healthy_upstream_byte_identical(self, mock_servers, tmp_path):
+        """Healthy upstream + passthrough mode: client must receive a stream
+        that contains a complete, parseable tool_call (the assembled
+        ``arguments`` JSON parses cleanly). Regression guard against any byte
+        corruption / chunk slicing issue introduced by the passthrough path.
+        """
+        ok_port = get_free_port()
+        ok_server = MockServer(
+            create_mock_upstream(behavior="tool_call_ok", name="ok"),
+            ok_port,
+        )
+        ok_server.start()
+        try:
+            config = ProxyConfig(
+                proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
+                endpoints=[EndpointConfig(name="ok", url=ok_server.url)],
+                streaming=StreamingConfig(tool_call_reconnect=False),
+                logging=LoggingConfig(db_path=str(tmp_path / "passthrough_ok.db")),
+                routing=[
+                    RouteConfig(
+                        name="ok-route",
+                        chain=[RouteStepConfig(endpoint="ok", model="mock-model", timeout_ms=5000)],
+                    ),
+                ],
+            )
+            app = create_app(config)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/chat/completions",
+                    json=_chat_body("ok-route", stream=True),
+                )
+
+            assert resp.status_code == 200
+            text = resp.text
+            assert "[DONE]" in text
+            import re, json as _json
+            args_pieces = re.findall(r'"arguments":\s*"((?:[^"\\]|\\.)*)"', text)
+            merged = "".join(_json.loads(f'"{p}"') for p in args_pieces)
+            parsed = _json.loads(merged)
+            assert parsed == {"path": "b.txt", "diff": "+ok"}
+            # Exactly one [DONE] — no spurious duplicate from outer finally
+            assert text.count("[DONE]") == 1
+        finally:
+            ok_server.stop()
+
+    def test_streaming_passthrough_cut_does_not_synthesize_done(self, mock_servers, tmp_path):
+        """BUG: in passthrough mode, when upstream cuts mid-tool_call, partial
+        bytes leak to the client (by design). But the outer finally currently
+        synthesizes ``data: [DONE]\\n\\n`` afterwards, which signals to the
+        client that the stream completed cleanly — causing it to parse the
+        partial JSON and raise ``JSON Parse error: Expected '}'``.
+
+        After the fix, the proxy must NOT emit a synthetic [DONE] when
+        passthrough mode encounters a mid-stream cut: the connection should
+        end without a terminator so the client treats it as a truncated
+        stream rather than a complete-but-corrupt one.
+        """
+        cut_port = get_free_port()
+        cut_server = MockServer(
+            create_mock_upstream(behavior="stream_cut_in_tool_call", name="cutter"),
+            cut_port,
+        )
+        cut_server.start()
+        try:
+            config = ProxyConfig(
+                proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
+                endpoints=[EndpointConfig(name="cutter", url=cut_server.url)],
+                streaming=StreamingConfig(tool_call_reconnect=False),
+                logging=LoggingConfig(db_path=str(tmp_path / "passthrough_cut.db")),
+                routing=[
+                    RouteConfig(
+                        name="cut-only",
+                        chain=[RouteStepConfig(endpoint="cutter", model="mock-model", timeout_ms=5000)],
+                    ),
+                ],
+            )
+            app = create_app(config)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/chat/completions",
+                    json=_chat_body("cut-only", stream=True),
+                )
+
+            assert resp.status_code == 200
+            text = resp.text
+            # Partial tool_call bytes leaked (passthrough semantics)
+            assert r'\"path\":\"a.t' in text
+            # No synthesized [DONE] — the upstream was cut, so the stream
+            # must not falsely advertise completion.
+            assert "[DONE]" not in text
+        finally:
+            cut_server.stop()
+
     def test_streaming_request_logged(self, proxy_config):
         """Streaming requests must also be persisted to the request log
         (regression guard: byte_generator's finally block previously fire-and-

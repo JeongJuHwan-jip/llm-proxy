@@ -859,6 +859,7 @@ async def _handle_stream(
         from .adapters.anthropic import SSEBuffer, _parse_sse_data
 
         completed = False
+        passthrough_cut = False
         current_resp: httpx.Response | None = first_resp
         try:
             while current_resp is not None:
@@ -879,6 +880,16 @@ async def _handle_stream(
                             "Upstream stream interrupted (passthrough): %s: %s",
                             type(exc).__name__, exc,
                         )
+                        # In passthrough mode any partial bytes (potentially
+                        # including a half-emitted tool_call) have already
+                        # reached the client. Synthesizing a "data: [DONE]"
+                        # afterwards would tell the client the stream
+                        # finished cleanly, causing it to parse the partial
+                        # JSON and raise "JSON Parse error: Expected '}'".
+                        # Skip the synthetic terminator and let the
+                        # connection close so the client sees a truncated
+                        # stream instead.
+                        passthrough_cut = True
                     finally:
                         try:
                             await current_resp.aclose()
@@ -978,7 +989,7 @@ async def _handle_stream(
                     completed = True
                     break
         finally:
-            if not completed:
+            if not completed and not passthrough_cut:
                 try:
                     yield b"data: [DONE]\n\n"
                 except Exception:

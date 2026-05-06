@@ -495,6 +495,11 @@ class TestAnthropicStreaming:
             text = resp.text
             # Recovering endpoint must NOT be reached when reconnect is off
             assert "gamma" not in text
+            # And no synthetic message_stop — emitting one would tell the
+            # client the message terminated cleanly when the upstream was
+            # actually cut, causing the client to parse a possibly-partial
+            # tool_use input_json as complete.
+            assert "event: message_stop" not in text
         finally:
             cut_server.stop()
             mock_servers.pop("cutter", None)
