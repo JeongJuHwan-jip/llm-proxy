@@ -166,6 +166,33 @@ def test_load_config_missing_file():
         load_config("/nonexistent/path/config.yaml")
 
 
+def test_streaming_tool_call_reconnect_default_true():
+    """``streaming.tool_call_reconnect`` defaults to True (stitching enabled)."""
+    cfg_data = {
+        "endpoints": [{"name": "ep", "url": "https://ep.example.com/v1"}]
+    }
+    path = _write_config(cfg_data)
+    try:
+        cfg = load_config(path)
+        assert cfg.streaming.tool_call_reconnect is True
+    finally:
+        path.unlink()
+
+
+def test_streaming_tool_call_reconnect_can_be_disabled():
+    """``streaming.tool_call_reconnect: false`` enables verbatim passthrough."""
+    cfg_data = {
+        "endpoints": [{"name": "ep", "url": "https://ep.example.com/v1"}],
+        "streaming": {"tool_call_reconnect": False},
+    }
+    path = _write_config(cfg_data)
+    try:
+        cfg = load_config(path)
+        assert cfg.streaming.tool_call_reconnect is False
+    finally:
+        path.unlink()
+
+
 def test_ssl_verify_default_is_true():
     cfg_data = {
         "endpoints": [{"name": "ep", "url": "https://ep.example.com/v1"}]

@@ -18,6 +18,7 @@ from llm_proxy.config import (
     ProxyServerConfig,
     RouteConfig,
     RouteStepConfig,
+    StreamingConfig,
 )
 from llm_proxy.server import create_app
 from mock_upstream import MockServer, create_mock_upstream, get_free_port
@@ -255,6 +256,64 @@ class TestE2EFailover:
             merged = "".join(_json.loads(f'"{p}"') for p in args_pieces)
             parsed = _json.loads(merged)
             assert parsed == {"path": "b.txt", "diff": "+ok"}
+        finally:
+            cut_server.stop()
+            ok_server.stop()
+
+    def test_streaming_tool_call_reconnect_disabled_passes_through(self, mock_servers, tmp_path):
+        """With ``streaming.tool_call_reconnect: false`` the proxy must forward
+        the upstream's bytes verbatim. The cut endpoint's partial tool_call
+        chunks reach the client (no buffering), and the proxy must NOT switch
+        to the next upstream on the mid-stream cut. This is the opt-out path
+        from the buffering+stitching default behavior.
+        """
+        cut_port = get_free_port()
+        ok_port = get_free_port()
+        cut_server = MockServer(
+            create_mock_upstream(behavior="stream_cut_in_tool_call", name="cutter"),
+            cut_port,
+        )
+        ok_server = MockServer(
+            create_mock_upstream(behavior="tool_call_ok", name="recoverer"),
+            ok_port,
+        )
+        cut_server.start()
+        ok_server.start()
+        try:
+            config = ProxyConfig(
+                proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
+                endpoints=[
+                    EndpointConfig(name="cutter", url=cut_server.url),
+                    EndpointConfig(name="recoverer", url=ok_server.url),
+                ],
+                failover=FailoverConfig(max_retries=3),
+                streaming=StreamingConfig(tool_call_reconnect=False),
+                logging=LoggingConfig(db_path=str(tmp_path / "passthrough.db")),
+                routing=[
+                    RouteConfig(
+                        name="cut-then-tool-ok",
+                        chain=[
+                            RouteStepConfig(endpoint="cutter", model="mock-model", timeout_ms=5000),
+                            RouteStepConfig(endpoint="recoverer", model="mock-model", timeout_ms=5000),
+                        ],
+                    ),
+                ],
+            )
+            app = create_app(config)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/chat/completions",
+                    json=_chat_body("cut-then-tool-ok", stream=True),
+                )
+
+            assert resp.status_code == 200
+            text = resp.text
+            # Passthrough mode: the cut endpoint's partial tool_call bytes
+            # must reach the client (proof that no buffering occurred).
+            assert r'\"path\":\"a.t' in text
+            # And no reconnection: the recovering endpoint's payload must
+            # NOT appear since the proxy did not pull a second upstream.
+            assert r'\"diff\":\"+ok\"' not in text
         finally:
             cut_server.stop()
             ok_server.stop()

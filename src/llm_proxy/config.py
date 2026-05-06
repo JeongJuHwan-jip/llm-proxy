@@ -74,6 +74,21 @@ class LoggingConfig(BaseModel):
     log_request_body: bool = False
 
 
+class StreamingConfig(BaseModel):
+    """Per-stream behavior knobs.
+
+    ``tool_call_reconnect`` — when True (default), mid-stream upstream
+    disconnects during a streaming response transparently fail over to the
+    next upstream and the client sees a single, stitched stream. Partial
+    tool_call deltas from the cut upstream are buffered and discarded so the
+    client never sees malformed JSON. When False, packets are forwarded
+    verbatim and a mid-stream cut simply ends the response (no buffering,
+    no upstream reconnection).
+    """
+
+    tool_call_reconnect: bool = True
+
+
 class AuthConfig(BaseModel):
     api_keys: list[str] = Field(default_factory=list)
 
@@ -119,6 +134,7 @@ class ProxyConfig(BaseModel):
     proxy: ProxyServerConfig = Field(default_factory=ProxyServerConfig)
     endpoints: list[EndpointConfig]
     failover: FailoverConfig = Field(default_factory=FailoverConfig)
+    streaming: StreamingConfig = Field(default_factory=StreamingConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     auth: AuthConfig | None = None
     # Inline routing — used when settings.json is absent.

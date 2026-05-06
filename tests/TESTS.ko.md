@@ -35,6 +35,8 @@
 - **test_load_config_invalid_url_raises** — `ftp://` 같은 비-HTTP URL이면 예외.
 - **test_load_config_env_key** — `auth.api_keys` 안에서도 `{{env:...}}` 치환이 동작.
 - **test_load_config_missing_file** — 존재하지 않는 파일 경로에 대해 `FileNotFoundError`.
+- **test_streaming_tool_call_reconnect_default_true** — `streaming.tool_call_reconnect`가 명시되지 않으면 기본값 `True`(중간 끊김 시 다음 업스트림으로 재접속 + tool_call 버퍼링).
+- **test_streaming_tool_call_reconnect_can_be_disabled** — `streaming.tool_call_reconnect: false`로 설정하면 `False`로 로딩(패킷을 그대로 통과시키는 패스스루 모드).
 - **test_ssl_verify_default_is_true** — `ssl_verify` 옵션을 명시하지 않으면 기본값 `True`(SSL 검증 활성화)로 로딩.
 - **test_ssl_verify_can_be_disabled** — `ssl_verify: false`로 설정하면 `False`로 로딩.
 - **test_ssl_verify_propagates_to_endpoint_state** — `ssl_verify: false`로 설정된 엔드포인트가 `EndpointState.ssl_verify == False`로 전파.
@@ -148,6 +150,7 @@
 - **test_streaming_failover** — 스트리밍 요청도 정상 페일오버, `text/event-stream` 응답.
 - **test_streaming_midcut_falls_over_to_next** — 스트리밍 도중 업스트림이 끊기면(`stream_cut` mock) `byte_generator`가 다음 endpoint로 자동 전환해 끊김 없이 클라이언트에 콘텐츠 전달.
 - **test_streaming_tool_call_cut_does_not_leak_partial** — tool_call 인자 도중 업스트림이 끊겨도 partial JSON이 클라이언트에 노출되지 않고, 회복 endpoint의 완전한 tool_call만 전달됨 (Roo Code 류 클라이언트의 `index` 기반 tool_call 병합 충돌 방지). 클라이언트가 보는 청크들에서 `arguments`를 합쳐 보면 `{"path":"b.txt","diff":"+ok"}`로 정상 파싱.
+- **test_streaming_tool_call_reconnect_disabled_passes_through** — `streaming.tool_call_reconnect: false`로 설정하면 프록시는 업스트림 바이트를 그대로 전달하고(끊긴 endpoint의 partial tool_call이 클라이언트에 도달), 다음 업스트림으로 재접속하지 않음(회복 endpoint 콘텐츠 미전달).
 - **test_streaming_request_logged** — 스트리밍 요청도 SQLite 로그에 `is_stream=True`로 기록 (회귀 가드: `byte_generator`의 finally 블록이 fire-and-forget로 로그를 누락했던 버그 방지).
 
 ### `TestE2EAllFail`
@@ -258,6 +261,7 @@
 - **test_streaming_failover** — 스트리밍에서도 페일오버 동작 (gamma 응답).
 - **test_streaming_direct_to_healthy** — 직접 지정 스트리밍 동작.
 - **test_streaming_midcut_falls_over_to_next** — 스트리밍 도중 업스트림이 끊기면(`stream_cut` mock) Anthropic 어댑터가 다음 endpoint로 전환, `message_start`/`message_stop`은 정확히 1번씩, 회복 endpoint(gamma) 콘텐츠가 포함됨.
+- **test_streaming_midcut_no_reconnect_when_disabled** — `streaming.tool_call_reconnect: false`이면 Anthropic 스트리밍에서도 중간 끊김 발생 시 다음 endpoint로 전환하지 않음(회복 endpoint(gamma) 콘텐츠 미포함).
 - **test_streaming_all_fail_returns_error** — 스트리밍 중 모든 step 실패 → 502 + Anthropic error JSON.
 
 ### `TestOpenAIRegressionFromAnthropicTests` — OpenAI 회귀 검증
