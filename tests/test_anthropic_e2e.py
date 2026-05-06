@@ -20,6 +20,7 @@ from llm_proxy.config import (
     ProxyServerConfig,
     RouteConfig,
     RouteStepConfig,
+    StreamingConfig,
 )
 from llm_proxy.server import create_app
 from mock_upstream import MockServer, create_mock_upstream, get_free_port
@@ -446,6 +447,54 @@ class TestAnthropicStreaming:
             assert text.count("event: message_stop") == 1
             # Content from the recovering endpoint reached the client
             assert "gamma" in text
+        finally:
+            cut_server.stop()
+            mock_servers.pop("cutter", None)
+
+    def test_streaming_midcut_no_reconnect_when_disabled(self, mock_servers, tmp_path):
+        """With ``streaming.tool_call_reconnect: false`` a mid-stream cut on
+        the first upstream must NOT trigger a switch to the next endpoint —
+        the stream simply ends. The recovering endpoint's content must not
+        appear in the output.
+        """
+        cut_port = get_free_port()
+        cut_server = MockServer(
+            create_mock_upstream(behavior="stream_cut", name="cutter"),
+            cut_port,
+        )
+        cut_server.start()
+        try:
+            mock_servers["cutter"] = cut_server
+            config = ProxyConfig(
+                proxy=ProxyServerConfig(host="127.0.0.1", port=9999),
+                endpoints=[
+                    EndpointConfig(name="cutter", url=cut_server.url),
+                    EndpointConfig(name="gamma", url=mock_servers["gamma"].url),
+                ],
+                failover=FailoverConfig(max_retries=3),
+                streaming=StreamingConfig(tool_call_reconnect=False),
+                logging=LoggingConfig(db_path=str(tmp_path / "anthropic_passthrough.db")),
+                routing=[
+                    RouteConfig(
+                        name="cut-then-ok",
+                        chain=[
+                            RouteStepConfig(endpoint="cutter", model="mock-model", timeout_ms=5000),
+                            RouteStepConfig(endpoint="gamma", model="mock-model", timeout_ms=5000),
+                        ],
+                    ),
+                ],
+            )
+            app = create_app(config)
+            with TestClient(app, raise_server_exceptions=False) as client:
+                resp = client.post(
+                    "/v1/messages",
+                    json=_anthropic_body("cut-then-ok", stream=True),
+                )
+
+            assert resp.status_code == 200
+            text = resp.text
+            # Recovering endpoint must NOT be reached when reconnect is off
+            assert "gamma" not in text
         finally:
             cut_server.stop()
             mock_servers.pop("cutter", None)

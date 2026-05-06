@@ -43,6 +43,18 @@ endpoints:
 # To reload settings at runtime without restarting:
 #   curl -X POST http://localhost:8000/api/routing/reload
 
+# Streaming behavior knobs.
+#   tool_call_reconnect: true (default)
+#     If an upstream cuts mid-stream during a tool_call, the proxy buffers
+#     the partial tool_call deltas, transparently fails over to the next
+#     upstream, and emits a single stitched stream to the client.
+#   tool_call_reconnect: false
+#     Pure passthrough — packets received from upstream are forwarded to the
+#     client verbatim. A mid-stream cut simply ends the response; no
+#     buffering and no upstream reconnection.
+streaming:
+  tool_call_reconnect: true
+
 logging:
   db_path: "./data/proxy.db"
   log_request_body: false

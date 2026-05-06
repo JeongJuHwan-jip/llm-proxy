@@ -841,12 +841,14 @@ async def _handle_anthropic_stream(
         return anthropic_error("api_error", "All upstream endpoints failed", 502)
 
     cached: list["tuple[httpx.Response, str] | None"] = [first]
+    reconnect_enabled = cfg.streaming.tool_call_reconnect
 
     async def factory() -> "tuple[httpx.Response, str] | None":
         if cached:
             return cached.pop()
-        # Direct mode: never retry mid-stream
-        if is_direct:
+        # Direct mode: never retry mid-stream.
+        # Same when tool_call reconnect is disabled — pure passthrough.
+        if is_direct or not reconnect_enabled:
             return None
         return await next_upstream()
 

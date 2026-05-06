@@ -837,6 +837,8 @@ async def _handle_stream(
 
     first_resp, first_step = first
 
+    reconnect_enabled = cfg.streaming.tool_call_reconnect
+
     async def byte_generator() -> AsyncIterator[bytes]:
         """SSE-aware passthrough that holds back partial tool_call chunks.
 
@@ -849,6 +851,10 @@ async def _handle_stream(
 
         Pre-tool_call text content is forwarded live; the buffering window
         opens only when a tool_call begins.
+
+        When ``cfg.streaming.tool_call_reconnect`` is False, this degrades to
+        a verbatim byte passthrough: no buffering, no upstream reconnect on
+        a mid-stream cut.
         """
         from .adapters.anthropic import SSEBuffer, _parse_sse_data
 
@@ -856,6 +862,30 @@ async def _handle_stream(
         current_resp: httpx.Response | None = first_resp
         try:
             while current_resp is not None:
+                if not reconnect_enabled:
+                    try:
+                        async for chunk in current_resp.aiter_bytes():
+                            yield chunk
+                        completed = True
+                    except asyncio.CancelledError:
+                        try:
+                            await current_resp.aclose()
+                        except Exception:
+                            pass
+                        current_resp = None
+                        raise
+                    except Exception as exc:
+                        logger.warning(
+                            "Upstream stream interrupted (passthrough): %s: %s",
+                            type(exc).__name__, exc,
+                        )
+                    finally:
+                        try:
+                            await current_resp.aclose()
+                        except Exception:
+                            pass
+                    current_resp = None
+                    break
                 sse_buf = SSEBuffer()
                 pending: list[bytes] = []
                 in_tool_call = False
